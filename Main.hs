@@ -9,8 +9,10 @@ import Data.Word (Word64)
 import Data.Bits ((.&.), (.|.), xor, shiftR)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import System.Environment (getArgs)
-import System.Random (StdGen, newStdGen, randomR, split)
+import System.Random (StdGen, newStdGen, randomR)
 import Control.Monad (foldM)
+import Data.List (foldl', intercalate, isPrefixOf, break)
+import Data.Either (lefts, rights)
 
 -- =============================================================================
 -- AST Data Types
@@ -44,7 +46,10 @@ data Expr
 
 data VarName = X | Y deriving (Show, Eq)
 
-type Population = [Expr]
+data Genotype = Genotype String Expr deriving (Show)
+type Population = [Genotype]
+
+data Dictionary = Dictionary [String] [String] [String]
 
 -- =============================================================================
 -- CLI Configuration
@@ -60,7 +65,8 @@ data Config = Config
     , width    :: Int
     , height   :: Int
     , aa       :: Bool
-    , srcFile  :: String
+    , dictFile :: String
+    , srcFiles :: [String]
     } deriving (Show)
 
 defaultConfig :: Config
@@ -72,7 +78,8 @@ defaultConfig = Config
     , width    = 256
     , height   = 256
     , aa       = False
-    , srcFile  = "population.gen"
+    , dictFile = "dictionary.txt"
+    , srcFiles = []
     }
 
 -- =============================================================================
@@ -97,9 +104,6 @@ parseList = between (char '(') (char ')') $ do
     spaces
     exprs <- sepEndBy parseSExpr' spaces
     return (SList exprs)
-
-parseSExprs :: Parser [SExpr]
-parseSExprs = spaces *> sepEndBy parseSExpr' spaces <* eof
 
 -- =============================================================================
 -- S-Expression to AST Conversion
@@ -192,6 +196,64 @@ showSExpr (SList xs) = "(" ++ unwords (map showSExpr xs) ++ ")"
 
 showExpr :: Expr -> String
 showExpr = showSExpr . fromExpr
+
+showGenotype :: Genotype -> String
+showGenotype (Genotype name body) = "(define (" ++ name ++ ")\n  " ++ showExpr body ++ ")"
+
+-- =============================================================================
+-- File I/O & Dictionary Parsing
+-- =============================================================================
+
+parseGenotype :: Parser Genotype
+parseGenotype = do
+    _ <- char '('
+    spaces
+    _ <- string "define"
+    spaces
+    _ <- char '('
+    spaces
+    name <- many1 (noneOf " \t\n\r)")
+    spaces
+    _ <- char ')'    -- This closes the name parenthesis
+    spaces
+    bodyExpr <- parseSExpr'  -- This parses the actual math expression
+    spaces
+    _ <- char ')'    -- This closes the outer define parenthesis
+    spaces
+    case toExpr bodyExpr of
+        Left err -> fail $ "Invalid body in " ++ name ++ ": " ++ err
+        Right expr -> return (Genotype name expr)
+
+parseGenotypes :: Parser [Genotype]
+parseGenotypes = spaces *> sepEndBy parseGenotype spaces <* eof
+
+writePopulation :: FilePath -> Population -> IO ()
+writePopulation path pop = writeFile path (intercalate "\n\n" $ map showGenotype pop)
+
+readPopulation :: FilePath -> IO (Either String Population)
+readPopulation path = do
+    contents <- readFile path
+    return $ case parse parseGenotypes "" contents of
+        Left err -> Left (show err)
+        Right genotypes -> Right genotypes
+
+readDictionary :: FilePath -> IO (Either String Dictionary)
+readDictionary path = do
+    contents <- readFile path
+    return $ parseDict contents
+
+parseDict :: String -> Either String Dictionary
+parseDict contents = 
+    let ls = lines contents
+        (h1, r1) = break ("[ADJECTIVES2]" `isPrefixOf`) ls
+        (h2, r2) = break ("[NOUNS]" `isPrefixOf`) r1
+        getWords section = map (head . words) $ filter (not . null . words) $ tail section
+        a1 = getWords h1
+        a2 = getWords h2
+        ns = getWords r2
+    in if null a1 || null a2 || null ns
+       then Left "Dictionary missing required sections: [ADJECTIVES1], [ADJECTIVES2], [NOUNS]"
+       else Right (Dictionary a1 a2 ns)
 
 -- =============================================================================
 -- Pixel Value Operations
@@ -377,16 +439,63 @@ toPixelRGB8 :: PixelValue -> PixelRGB8
 toPixelRGB8 (Scalar s) = PixelRGB8 (toByte s) (toByte s) (toByte s)
 toPixelRGB8 (Color r g b) = PixelRGB8 (toByte r) (toByte g) (toByte b)
 
-toNormalized :: Int -> Int -> Int -> Int -> (Double, Double)
-toNormalized width height px py = ((fromIntegral px / fromIntegral width) * 2 - 1, (fromIntegral py / fromIntegral height) * 2 - 1)
-
 renderExpr :: Config -> Expr -> Either String (Image PixelRGB8)
 renderExpr cfg expr = Right $ generateImage pixelFn (width cfg) (height cfg)
-  where pixelFn px py = let (nx, ny) = toNormalized (width cfg) (height cfg) px py
-                        in case evalExpr expr nx ny of Just val -> toPixelRGB8 val; Nothing -> PixelRGB8 255 0 255
+  where
+    w = width cfg
+    h = height cfg
+    normX px = (px / fromIntegral w) * 2 - 1
+    normY py = (py / fromIntegral h) * 2 - 1
+
+    pixelFn px py 
+      | aa cfg    = aaPixel px py
+      | otherwise = singlePixel px py
+
+    singlePixel px py = 
+      case evalExpr expr (normX (fromIntegral px)) (normY (fromIntegral py)) of 
+        Just val -> toPixelRGB8 val
+        Nothing  -> PixelRGB8 255 0 255
+
+    aaPixel px py = 
+      let offsets = [ (0.25, 0.25), (0.75, 0.25)
+                    , (0.25, 0.75), (0.75, 0.75) ]
+          samples = [ evalNorm (normX (fromIntegral px + dx)) (normY (fromIntegral py + dy)) 
+                    | (dx, dy) <- offsets ]
+      in averagePixel samples
+
+    evalNorm nx ny = 
+      case evalExpr expr nx ny of 
+        Just val -> val
+        Nothing  -> Scalar 0 
+
+    averagePixel vals = 
+      let (r, g, b, c) = foldl' accumulate (0.0, 0.0, 0.0, 0) vals
+          invC = 1.0 / fromIntegral c
+      in PixelRGB8 (toByte (r * invC)) (toByte (g * invC)) (toByte (b * invC))
+
+    accumulate (r, g, b, c) (Scalar s) = (r + s, g + s, b + s, c + 1)
+    accumulate (r, g, b, c) (Color cr cg cb) = (r + cr, g + cg, b + cb, c + 1)
 
 -- =============================================================================
--- Random Expression Generator (Iteration 7)
+-- Random Helpers
+-- =============================================================================
+
+mapStateList :: (s -> a -> (b, s)) -> s -> [a] -> ([b], s)
+mapStateList _ s [] = ([], s)
+mapStateList f s (x:xs) = 
+    let (y, s') = f s x
+        (ys, s'') = mapStateList f s' xs
+    in (y:ys, s'')
+
+randomName :: StdGen -> Dictionary -> (String, StdGen)
+randomName g (Dictionary a1 a2 n) =
+    let (i1, g1) = randomR (0, length a1 - 1) g
+        (i2, g2) = randomR (0, length a2 - 1) g1
+        (i3, g3) = randomR (0, length n - 1) g2
+    in (a1 !! i1 ++ "-" ++ a2 !! i2 ++ "-" ++ n !! i3, g3)
+
+-- =============================================================================
+-- Random Expression Generator
 -- =============================================================================
 
 randomExpr :: StdGen -> Int -> (Expr, StdGen)
@@ -409,7 +518,7 @@ randomLeaf g =
         1 -> (EVar Y, g1)
         2 -> (EConst c, g2)
         3 -> (EVec cr cg cb, g5)
-        _ -> (EVar X, g1) -- Unreachable
+        _ -> (EVar X, g1)
   where
     (r, g1) = randomR (0, 3 :: Int) g
     (c, g2) = randomR (-1.0, 1.0) g1
@@ -418,9 +527,7 @@ randomLeaf g =
     (cb, g5) = randomR (0.0, 1.0) g4
 
 randomUnary :: StdGen -> Int -> (Expr, StdGen)
-randomUnary g depth =
-    let (a, g1) = randomExpr g (depth - 1)
-    in (EAbs a, g1)
+randomUnary g depth = let (a, g1) = randomExpr g (depth - 1) in (EAbs a, g1)
 
 randomBinary :: StdGen -> Int -> (Expr, StdGen)
 randomBinary g depth =
@@ -435,32 +542,257 @@ randomJulia :: StdGen -> Int -> (Expr, StdGen)
 randomJulia g depth =
     let (a, g1) = randomExpr g (depth - 1)
         (b, g2) = randomExpr g1 (depth - 1)
-        (c, g3) = randomLeaf g2 -- Keep constant C as a leaf to avoid insane nesting
+        (c, g3) = randomLeaf g2 
     in (EJulia a b c, g3)
 
 generatePopulation :: Config -> IO Population
 generatePopulation cfg = do
-    g <- newStdGen
-    let (gens, _) = split g
-        (exprs, _) = mapAccumL (\gen _ -> randomExpr gen (depth cfg)) gens [1..genSize cfg]
-    return exprs
+    dictE <- readDictionary (dictFile cfg)
+    case dictE of
+        Left err -> do
+            putStrLn $ "Dictionary error: " ++ err
+            return []
+        Right dict -> do
+            g <- newStdGen
+            let (exprs, g1) = mapStateList (\gen _ -> randomExpr gen (depth cfg)) g [1..genSize cfg]
+                (names, _) = mapStateList (\gen _ -> randomName gen dict) g1 [1..genSize cfg]
+            return (zipWith Genotype names exprs)
+
+-- =============================================================================
+-- Mutation Operations
+-- =============================================================================
+
+sizeExpr :: Expr -> Int
+sizeExpr (EConst _)     = 1
+sizeExpr (EVec _ _ _)   = 1
+sizeExpr (EVar _)       = 1
+sizeExpr (EAbs a)       = 1 + sizeExpr a
+sizeExpr (EAdd a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (ESub a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMult a b)    = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EDiv a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMod a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EAnd a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EOr a b)      = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EXor a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EPolarCoords a b) = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMandelbrot a b)  = 1 + sizeExpr a + sizeExpr b
+sizeExpr (ENewton a b)      = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EBwNoise a b)     = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EColorNoise a b)  = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EJulia a b c)     = 1 + sizeExpr a + sizeExpr b + sizeExpr c
+
+getAllNodes :: Expr -> [Expr]
+getAllNodes e@(EConst _)     = [e]
+getAllNodes e@(EVec _ _ _)   = [e]
+getAllNodes e@(EVar _)       = [e]
+getAllNodes e@(EAbs a)       = e : getAllNodes a
+getAllNodes e@(EAdd a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(ESub a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMult a b)    = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EDiv a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMod a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EAnd a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EOr a b)      = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EXor a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EPolarCoords a b) = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMandelbrot a b)  = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(ENewton a b)      = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EBwNoise a b)     = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EColorNoise a b)  = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EJulia a b c)     = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c
+
+clamp01 :: Double -> Double
+clamp01 v = max 0.0 (min 1.0 v)
+
+mutateExpr :: StdGen -> Int -> Expr -> (Expr, StdGen)
+mutateExpr g baseRate expr =
+    let sz = max (sizeExpr expr) 1
+        prob = fromIntegral baseRate / 10.0 / fromIntegral sz
+        (shouldMutate, g1) = randomR (0.0, 1.0 :: Double) g
+    in if shouldMutate < prob
+       then applyRandomMutation g1 baseRate expr
+       else mutateChildren g1 baseRate expr
+
+mutateChildren :: StdGen -> Int -> Expr -> (Expr, StdGen)
+mutateChildren g _ e@(EConst _)     = (e, g)
+mutateChildren g _ e@(EVec _ _ _)   = (e, g)
+mutateChildren g _ e@(EVar _)       = (e, g)
+mutateChildren g r (EAbs a)       = let (a', g1) = mutateExpr g r a in (EAbs a', g1)
+mutateChildren g r (EAdd a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAdd a' b', g2)
+mutateChildren g r (ESub a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ESub a' b', g2)
+mutateChildren g r (EMult a b)    = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMult a' b', g2)
+mutateChildren g r (EDiv a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EDiv a' b', g2)
+mutateChildren g r (EMod a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMod a' b', g2)
+mutateChildren g r (EAnd a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAnd a' b', g2)
+mutateChildren g r (EOr a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EOr a' b', g2)
+mutateChildren g r (EXor a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EXor a' b', g2)
+mutateChildren g r (EPolarCoords a b) = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EPolarCoords a' b', g2)
+mutateChildren g r (EMandelbrot a b)  = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMandelbrot a' b', g2)
+mutateChildren g r (ENewton a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ENewton a' b', g2)
+mutateChildren g r (EBwNoise a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EBwNoise a' b', g2)
+mutateChildren g r (EColorNoise a b)  = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EColorNoise a' b', g2)
+mutateChildren g r (EJulia a b c)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c in (EJulia a' b' c', g3)
+
+applyRandomMutation :: StdGen -> Int -> Expr -> (Expr, StdGen)
+applyRandomMutation g rate expr =
+    let (mType, g1) = randomR (0, 6 :: Int) g
+    in case mType of
+        0 -> let depth = max 2 (sizeExpr expr `div` 3) in randomExpr g1 depth
+        1 -> case expr of
+                EConst d -> let (delta, g2) = randomR (-0.2, 0.2) g1 in (EConst (d + delta), g2)
+                _ -> (expr, g1)
+        2 -> case expr of
+                EVec r gb b -> 
+                    let (dr, g2) = randomR (-0.2, 0.2) g1
+                        (dg, g3) = randomR (-0.2, 0.2) g2
+                        (db, g4) = randomR (-0.2, 0.2) g3
+                    in (EVec (clamp01 (r+dr)) (clamp01 (gb+dg)) (clamp01 (b+db)), g4)
+                _ -> (expr, g1)
+        3 -> swapFunction g1 expr
+        4 -> wrapInFunction g1 expr
+        5 -> unwrapFunction g1 expr
+        6 -> let nodes = getAllNodes expr
+             in if length nodes > 1
+                then let (idx, g2) = randomR (0, length nodes - 1) g1
+                     in (nodes !! idx, g2)
+                else (expr, g1)
+
+swapFunction :: StdGen -> Expr -> (Expr, StdGen)
+swapFunction g (EAbs a) = (EAbs a, g)
+swapFunction g expr =
+    let fns = [EAdd, ESub, EMult, EDiv, EMod, EAnd, EOr, EXor, EPolarCoords, EMandelbrot, ENewton, EBwNoise, EColorNoise]
+        (idx, g1) = randomR (0, length fns - 1) g
+        fn = fns !! idx
+    in case expr of
+        EAdd a b       -> (fn a b, g1)
+        ESub a b       -> (fn a b, g1)
+        EMult a b      -> (fn a b, g1)
+        EDiv a b       -> (fn a b, g1)
+        EMod a b       -> (fn a b, g1)
+        EAnd a b       -> (fn a b, g1)
+        EOr a b        -> (fn a b, g1)
+        EXor a b       -> (fn a b, g1)
+        EPolarCoords a b -> (fn a b, g1)
+        EMandelbrot a b  -> (fn a b, g1)
+        ENewton a b      -> (fn a b, g1)
+        EBwNoise a b     -> (fn a b, g1)
+        EColorNoise a b  -> (fn a b, g1)
+        _                -> (expr, g)
+
+wrapInFunction :: StdGen -> Expr -> (Expr, StdGen)
+wrapInFunction g expr =
+    let (wType, g1) = randomR (0, 2 :: Int) g
+    in case wType of
+        0 -> (EAbs expr, g1)
+        1 -> let (leaf, g2) = randomLeaf g1 in (EAdd expr leaf, g2)
+        2 -> let (leaf, g2) = randomLeaf g1 in (EMult expr leaf, g2)
+        _ -> (EAbs expr, g1)
+
+unwrapFunction :: StdGen -> Expr -> (Expr, StdGen)
+unwrapFunction g (EAbs a) = (a, g)
+unwrapFunction g (EJulia a b c) = 
+    let (idx, g1) = randomR (0, 2 :: Int) g
+    in ([a, b, c] !! idx, g1)
+unwrapFunction g expr =
+    let (idx, g1) = randomR (0, 1 :: Int) g
+    in case expr of
+        EAdd a b       -> (if idx == 0 then a else b, g1)
+        ESub a b       -> (if idx == 0 then a else b, g1)
+        EMult a b      -> (if idx == 0 then a else b, g1)
+        EDiv a b       -> (if idx == 0 then a else b, g1)
+        EMod a b       -> (if idx == 0 then a else b, g1)
+        EAnd a b       -> (if idx == 0 then a else b, g1)
+        EOr a b        -> (if idx == 0 then a else b, g1)
+        EXor a b       -> (if idx == 0 then a else b, g1)
+        EPolarCoords a b -> (if idx == 0 then a else b, g1)
+        EMandelbrot a b  -> (if idx == 0 then a else b, g1)
+        ENewton a b      -> (if idx == 0 then a else b, g1)
+        EBwNoise a b     -> (if idx == 0 then a else b, g1)
+        EColorNoise a b  -> (if idx == 0 then a else b, g1)
+        _                -> (expr, g)
+
+-- =============================================================================
+-- Breeding / Crossover Operations
+-- =============================================================================
+
+type Path = [Int]
+
+getAllPaths :: Expr -> [(Path, Expr)]
+getAllPaths e = [([], e)] ++ children
   where
-    mapAccumL f s [] = ([], s)
-    mapAccumL f s (x:xs) = let (y, s') = f s x; (ys, s'') = mapAccumL f s' xs in (y:ys, s'')
+    children = case e of
+        EConst _     -> []
+        EVec _ _ _   -> []
+        EVar _       -> []
+        EAbs a       -> map (\(p, n) -> (0:p, n)) (getAllPaths a)
+        EJulia a b c -> map (\(p, n) -> (0:p, n)) (getAllPaths a) 
+                     ++ map (\(p, n) -> (1:p, n)) (getAllPaths b) 
+                     ++ map (\(p, n) -> (2:p, n)) (getAllPaths c)
+        _ -> let (a, b) = getBinaryArgs e
+             in map (\(p, n) -> (0:p, n)) (getAllPaths a) 
+             ++ map (\(p, n) -> (1:p, n)) (getAllPaths b)
 
--- =============================================================================
--- File I/O
--- =============================================================================
+getBinaryArgs :: Expr -> (Expr, Expr)
+getBinaryArgs (EAdd a b) = (a, b)
+getBinaryArgs (ESub a b) = (a, b)
+getBinaryArgs (EMult a b) = (a, b)
+getBinaryArgs (EDiv a b) = (a, b)
+getBinaryArgs (EMod a b) = (a, b)
+getBinaryArgs (EAnd a b) = (a, b)
+getBinaryArgs (EOr a b) = (a, b)
+getBinaryArgs (EXor a b) = (a, b)
+getBinaryArgs (EPolarCoords a b) = (a, b)
+getBinaryArgs (EMandelbrot a b) = (a, b)
+getBinaryArgs (ENewton a b) = (a, b)
+getBinaryArgs (EBwNoise a b) = (a, b)
+getBinaryArgs (EColorNoise a b) = (a, b)
 
-writePopulation :: FilePath -> Population -> IO ()
-writePopulation path pop = writeFile path (unlines $ map showExpr pop)
+replaceAt :: Expr -> Path -> Expr -> Maybe Expr
+replaceAt _ [] new = Just new
+replaceAt e (0:ps) new = case e of
+    EAbs a -> EAbs <$> replaceAt a ps new
+    EJulia a b c -> (\a' -> EJulia a' b c) <$> replaceAt a ps new
+    _ -> let (a, b) = getBinaryArgs e
+             fn = constructorOf e
+         in (\a' -> fn a' b) <$> replaceAt a ps new
+replaceAt e (1:ps) new = case e of
+    EJulia a b c -> (\b' -> EJulia a b' c) <$> replaceAt b ps new
+    _ -> let (a, b) = getBinaryArgs e
+             fn = constructorOf e
+         in (\b' -> fn a b') <$> replaceAt b ps new
+replaceAt e (2:ps) new = case e of
+    EJulia a b c -> (\c' -> EJulia a b c') <$> replaceAt c ps new
+    _ -> Nothing
+replaceAt _ _ _ = Nothing
 
-readPopulation :: FilePath -> IO (Either String Population)
-readPopulation path = do
-    contents <- readFile path
-    return $ case parse parseSExprs "" contents of
-        Left err -> Left (show err)
-        Right sexprs -> mapM toExpr sexprs
+constructorOf :: Expr -> (Expr -> Expr -> Expr)
+constructorOf (EAdd _ _) = EAdd
+constructorOf (ESub _ _) = ESub
+constructorOf (EMult _ _) = EMult
+constructorOf (EDiv _ _) = EDiv
+constructorOf (EMod _ _) = EMod
+constructorOf (EAnd _ _) = EAnd
+constructorOf (EOr _ _) = EOr
+constructorOf (EXor _ _) = EXor
+constructorOf (EPolarCoords _ _) = EPolarCoords
+constructorOf (EMandelbrot _ _) = EMandelbrot
+constructorOf (ENewton _ _) = ENewton
+constructorOf (EBwNoise _ _) = EBwNoise
+constructorOf (EColorNoise _ _) = EColorNoise
+
+breedPair :: StdGen -> Int -> Expr -> Expr -> (Expr, StdGen)
+breedPair g rate p1 p2 =
+    let paths1 = getAllPaths p1
+        paths2 = getAllPaths p2
+        (idx1, g1) = randomR (0, length paths1 - 1) g
+        (idx2, g2) = randomR (0, length paths2 - 1) g1
+        (path1, _) = paths1 !! idx1
+        (_, sub2)  = paths2 !! idx2
+        child = case replaceAt p1 path1 sub2 of
+                  Just c -> c
+                  Nothing -> p1
+    in mutateExpr g2 rate child
 
 -- =============================================================================
 -- CLI Argument Parsing
@@ -500,7 +832,7 @@ parseArgs args = foldM parseOne defaultConfig args
         Right (w, h) -> Right cfg { width = w, height = h }
         Left err -> Left err
         
-    parseOne cfg f = Right cfg { srcFile = f } -- Assume it's the filename
+    parseOne cfg f = Right cfg { srcFiles = srcFiles cfg ++ [f] }
 
 -- =============================================================================
 -- Command Execution
@@ -509,35 +841,65 @@ parseArgs args = foldM parseOne defaultConfig args
 runCommand :: Config -> IO ()
 runCommand cfg = case cmd cfg of
     Generate -> runGenerate cfg
-    Breed    -> putStrLn "Error: --breed is not implemented until Iteration 9."
+    Breed    -> runBreed cfg
     Render   -> runRender cfg
 
 runGenerate :: Config -> IO ()
 runGenerate cfg = do
+    let outPath = if null (srcFiles cfg) then "population.gen" else last (srcFiles cfg)
     putStrLn $ "Generating " ++ show (genSize cfg) ++ " images at depth " ++ show (depth cfg) ++ "..."
     pop <- generatePopulation cfg
-    writePopulation (srcFile cfg) pop
-    putStrLn $ "Saved to " ++ srcFile cfg
-    mapM_ (\(i, e) -> putStrLn $ "  [" ++ show i ++ "] " ++ showExpr e) (zip [0..] pop)
+    if null pop then return () else do
+        writePopulation outPath pop
+        putStrLn $ "Saved to " ++ outPath
 
 runRender :: Config -> IO ()
 runRender cfg = do
-    result <- readPopulation (srcFile cfg)
-    case result of
-        Left err -> putStrLn $ "Error reading file: " ++ err
-        Right pop -> do
-            putStrLn $ "Rendering " ++ show (length pop) ++ " images..."
-            mapM_ (renderAndSave cfg) (zip [0..] pop)
-            putStrLn "Done."
+    let paths = if null (srcFiles cfg) then ["population.gen"] else srcFiles cfg
+    mapM_ (renderFile cfg) paths
   where
-    renderAndSave cfg (idx, expr) = do
-        let filename = "img_" ++ padNum idx ++ ".png"
+    renderFile cfg path = do
+        result <- readPopulation path
+        case result of
+            Left err -> putStrLn $ "Error reading " ++ path ++ ": " ++ err
+            Right pop -> do
+                putStrLn $ "Rendering " ++ show (length pop) ++ " images from " ++ path ++ "..."
+                mapM_ (renderAndSave cfg) (zip [0..] pop)
+                putStrLn $ "Finished " ++ path ++ "."
+    renderAndSave cfg (idx, Genotype name expr) = do
+        let filename = name ++ ".png"
         case renderExpr cfg expr of
             Left err -> putStrLn $ "  Error rendering " ++ filename ++ ": " ++ err
             Right img -> do
                 writePng filename img
-                putStrLn $ "  Wrote " ++ filename
+                putStrLn $ "  [" ++ padNum idx ++ "] Wrote " ++ filename
     padNum n = if n < 10 then "00" ++ show n else if n < 100 then "0" ++ show n else show n
+
+runBreed :: Config -> IO ()
+runBreed cfg = do
+    let paths = if null (srcFiles cfg) then ["population.gen"] else srcFiles cfg
+        (inputs, output) = if length paths == 1 then (paths, head paths) else (init paths, last paths)
+    result <- mapM readPopulation inputs
+    dictE <- readDictionary (dictFile cfg)
+    case (lefts result, dictE) of
+        (err:_, _) -> putStrLn $ "Error: " ++ err
+        (_, Left err) -> putStrLn $ "Dictionary error: " ++ err
+        (_, Right dict) -> do
+            let allParents = concat (rights result)
+                exprs = map (\(Genotype _ e) -> e) allParents
+                n = length exprs
+            if n < 2
+                then putStrLn "Error: Need at least 2 parents to breed."
+                else do
+                    putStrLn $ "Breeding " ++ show n ++ " parents..."
+                    g <- newStdGen
+                    let pairs = [(i, j) | i <- [0..n-1], j <- [0..n-1], i /= j]
+                    let (childExprs, g1) = mapStateList (\gen (i, j) -> breedPair gen (mutation cfg) (exprs !! i) (exprs !! j)) g pairs
+                        (childNames, _) = mapStateList (\gen _ -> randomName gen dict) g1 childExprs
+                        childGenotypes = zipWith Genotype childNames childExprs
+                    writePopulation output childGenotypes
+                    putStrLn $ "Generated " ++ show (length childGenotypes) ++ " offspring."
+                    putStrLn $ "Saved to " ++ output
 
 -- =============================================================================
 -- Main
@@ -549,12 +911,12 @@ main = do
     case parseArgs args of
         Left err -> do
             putStrLn $ "CLI Error: " ++ err
-            putStrLn "Usage: monadrian <opt> <args> <src_file>"
+            putStrLn "Usage: monadrian <opt> <args> <src_files>"
             putStrLn "  --generate         Generate a new population"
             putStrLn "  --render           Render a population to PNGs"
-            putStrLn "  --breed            Breed a population (Coming soon)"
+            putStrLn "  --breed            Breed a population via crossover + mutation"
             putStrLn "  -d[1-n]            Nesting depth for generation"
-            putStrLn "  -m[1-10]           Mutation rate for breeding"
+            putStrLn "  -m[1-10]           Mutation rate during breeding"
             putStrLn "  -g[1-n]            Number of images to generate"
             putStrLn "  -s[<w>x<h>]        Image dimensions"
             putStrLn "  -aa[0|1]           Anti-aliasing off/on"
