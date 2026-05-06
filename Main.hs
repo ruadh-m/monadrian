@@ -2,13 +2,11 @@
 
 module Main where
 
-import System.Environment (getArgs)
+import Codec.Picture
 import Text.Parsec
 import Text.Parsec.String (Parser)
 
--- =============================================================================
--- AST Data Types
--- =============================================================================
+-- AST DATA TYPES
 
 -- | A pixel value can be scalar (grayscale) or a color vector (RGB)
 data PixelValue
@@ -57,9 +55,7 @@ data VarName = X | Y deriving (Show, Eq)
 -- | A population of expressions (for breeding/generation)
 type Population = [Expr]
 
--- =============================================================================
--- S-Expression Parser
--- =============================================================================
+-- S-EXPRESSION PARSER
 
 -- | Raw s-expression before conversion to AST
 data SExpr
@@ -89,9 +85,7 @@ parseList = between (char '(') (char ')') $ do
 parseSExprs :: Parser [SExpr]
 parseSExprs = spaces *> sepEndBy parseSExpr' spaces <* eof
 
--- =============================================================================
--- S-Expression to AST Conversion
--- =============================================================================
+-- S-EXPRESSION TO AST CONVERTER
 
 -- | Convert an s-expression to an Expr
 toExpr :: SExpr -> Either String Expr
@@ -142,9 +136,7 @@ parseTernary :: String -> SExpr -> SExpr -> SExpr -> Either String Expr
 parseTernary "julia" a b c = EJulia <$> toExpr a <*> toExpr b <*> toExpr c
 parseTernary fn _ _ _      = Left $ "Unknown function: " ++ fn
 
--- =============================================================================
--- Expression to S-Expression (for serialization)
--- =============================================================================
+-- EXPRESSION TO S-EXPRESSION (FOR SERIALIZATION)
 
 -- | Convert an Expr back to S-Expression format
 fromExpr :: Expr -> SExpr
@@ -177,69 +169,109 @@ showSExpr (SList xs) = "(" ++ unwords (map showSExpr xs) ++ ")"
 showExpr :: Expr -> String
 showExpr = showSExpr . fromExpr
 
--- =============================================================================
--- Main (Testing)
--- =============================================================================
+-- EXPRESSION EVALUATOR
+
+-- | Evaluate an expression at normalized coordinates (x, y) in [-1, 1]
+-- Returns Nothing for unimplemented operations
+evalExpr :: Expr -> Double -> Double -> Maybe PixelValue
+evalExpr (EVar X) x _     = Just (Scalar x)
+evalExpr (EVar Y) _ y     = Just (Scalar y)
+evalExpr (EConst d) _ _   = Just (Scalar d)
+evalExpr (EVec r g b) _ _ = Just (Color r g b)
+evalExpr _ _ _             = Nothing
+
+-- PIXEL VALUE CONVERSION
+
+-- | Convert a normalized [0,1] value to an 8-bit color component
+toByte :: Double -> Pixel8
+toByte = clampByte . round . (* 255)
+  where
+    clampByte v
+        | v < 0     = 0
+        | v > 255   = 255
+        | otherwise = fromIntegral v
+
+-- | Convert a PixelValue to a JuicyPixels PixelRGB8
+-- Scalar values become grayscale
+toPixelRGB8 :: PixelValue -> PixelRGB8
+toPixelRGB8 (Scalar s) = PixelRGB8 (toByte s) (toByte s) (toByte s)
+toPixelRGB8 (Color r g b) = PixelRGB8 (toByte r) (toByte g) (toByte b)
+
+-- RENDERING
+
+-- | Render settings
+data RenderSettings = RenderSettings
+    { rsWidth  :: Int
+    , rsHeight :: Int
+    }
+    deriving (Show)
+
+defaultRenderSettings :: RenderSettings
+defaultRenderSettings = RenderSettings 256 256
+
+-- | Convert pixel coordinates to normalized [-1, 1] range
+toNormalized :: Int -> Int -> Int -> Int -> (Double, Double)
+toNormalized width height px py =
+    ( (fromIntegral px / fromIntegral width) * 2 - 1
+    , (fromIntegral py / fromIntegral height) * 2 - 1
+    )
+
+-- | Render an expression to an Image
+renderExpr :: RenderSettings -> Expr -> Either String (Image PixelRGB8)
+renderExpr settings expr =
+    let w = rsWidth settings
+        h = rsHeight settings
+        img = generateImage pixelFn w h
+        pixelFn px py =
+            let (nx, ny) = toNormalized w h px py
+            in case evalExpr expr nx ny of
+                Just val -> toPixelRGB8 val
+                Nothing  -> PixelRGB8 255 0 255  -- Magenta for unimplemented
+    in Right img
+
+-- | Write an image to a PNG file
+writePngFile :: FilePath -> Image PixelRGB8 -> IO ()
+writePngFile path img = writePng path img
+
+-- MAIN (testing)
 
 main :: IO ()
 main = do
-    putStrLn "=== Monadrian Iteration 1: Parser Test ==="
+    putStrLn "=== Monadrian: Test Outputs  ==="
     putStrLn ""
 
-    -- Test cases
-    let testCases =
-            [ "X"
-            , "Y"
-            , "0.5"
-            , "(add X 0.5)"
-            , "(sub Y X)"
-            , "(mult X Y)"
-            , "(div X 2.0)"
-            , "(mod X Y)"
-            , "(and X Y)"
-            , "(or X Y)"
-            , "(xor X Y)"
-            , "(abs X)"
-            , "(polar-coords X Y)"
-            , "(mandelbrot X Y)"
-            , "(julia X Y 0.355)"
-            , "(newton X Y)"
-            , "(bw-noise 0.1 42)"
-            , "(color-noise 0.05 123)"
-            , "(add (mult X 0.5) (abs Y))"
-            , "(mod (add X 1.0) (abs Y))"
+    -- Test expressions we can render in this iteration
+    let tests =
+            [ ("X", "Horizontal gradient (-1 to 1)", EVar X)
+            , ("Y", "Vertical gradient (-1 to 1)", EVar Y)
+            , ("0.5", "Solid mid-gray", EConst 0.5)
+            , ("0.0", "Solid black", EConst 0.0)
+            , ("1.0", "Solid white", EConst 1.0)
+            , ("vec", "Solid color (0.8, 0.2, 0.1)", EVec 0.8 0.2 0.1)
             ]
 
-    let runTest input = do
-            putStr $ "Parsing: " ++ input
-            case parse parseSExpr "" input of
-                Left err -> putStrLn $ " -> PARSE ERROR: " ++ show err
-                Right sexpr -> do
-                    putStrLn $ " -> SExpr: " ++ show sexpr
-                    case toExpr sexpr of
-                        Left err -> putStrLn $ "    -> CONV ERROR: " ++ err
-                        Right expr -> do
-                            putStrLn $ "    -> Expr:   " ++ show expr
-                            putStrLn $ "    -> Back:   " ++ showExpr expr
+    let settings = defaultRenderSettings
 
-    mapM_ runTest testCases
+    mapM_ (runRenderTest settings) tests
 
-    -- Test round-trip
-    putStrLn ""
-    putStrLn "=== Round-trip test ==="
-    let complexExpr = EAdd (EMult (EVar X) (EConst 0.5)) (EAbs (EVar Y))
-    let serialized = showExpr complexExpr
-    putStrLn $ "Original: " ++ show complexExpr
-    putStrLn $ "Serialized: " ++ serialized
-    case parse parseSExpr "" serialized of
-        Left err -> putStrLn $ "Round-trip parse failed: " ++ show err
-        Right sexpr -> case toExpr sexpr of
-            Left err -> putStrLn $ "Round-trip convert failed: " ++ err
-            Right expr
-                | expr == complexExpr -> putStrLn "Round-trip SUCCESS: expressions match!"
-                | otherwise -> putStrLn $ "Round-trip FAILED: got " ++ show expr
+    -- Test that unimplemented expressions render as magenta
+    putStrLn "Testing unimplemented expression (should be magenta)..."
+    let unimplExpr = EAdd (EVar X) (EVar Y)
+    case renderExpr settings unimplExpr of
+        Left err -> putStrLn $ "  Render error: " ++ err
+        Right img -> do
+            writePngFile "test_unimplemented.png" img
+            putStrLn $ "  Wrote test_unimplemented.png"
 
     putStrLn ""
-    putStrLn "=== Error cases ==="
-    let errorCases = ["Z", "(unknown X)", "(add)", "(add X Y Z)"]
-    mapM_ runTest errorCases
+    putStrLn "Done! Check the test_*.png files."
+
+runRenderTest :: RenderSettings -> (String, String, Expr) -> IO ()
+runRenderTest settings (name, desc, expr) = do
+    putStrLn $ "Rendering: " ++ name ++ " -- " ++ desc
+    case renderExpr settings expr of
+        Left err -> putStrLn $ "  ERROR: " ++ err
+        Right img -> do
+            let filename = "test_" ++ name ++ ".png"
+            writePngFile filename img
+            putStrLn $ "  Wrote " ++ filename
