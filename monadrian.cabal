@@ -1,0 +1,25 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.39.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           monadrian
+version:        0.1.0.0
+license:        MIT
+license-file:   LICENSE
+build-type:     Simple
+
+executable monadrian
+  main-is: Main.hs
+  other-modules:
+      Paths_monadrian
+  ghc-options: -Wall -O2 -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      JuicyPixels >=3.3
+    , base >=4.14 && <5
+    , parallel >=3.2
+    , parsec >=3.1
+    , random >=1.2
+    , vector >=0.12
+  default-language: Haskell2010

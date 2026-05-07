@@ -3,16 +3,18 @@
 module Main where
 
 import Codec.Picture
-import Text.Parsec
-import Text.Parsec.String (Parser)
-import Data.Word (Word64)
+import Control.Monad (foldM, forM_)
+import Control.Parallel.Strategies (rseq, using, parList)
 import Data.Bits ((.&.), (.|.), xor, shiftR)
+import Data.Either (lefts, rights)
+import Data.List (break, foldl', intercalate, isPrefixOf)
+import qualified Data.Vector.Storable as V
+import Data.Word (Word64, Word8)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import System.Environment (getArgs)
 import System.Random (StdGen, newStdGen, randomR)
-import Control.Monad (foldM)
-import Data.List (foldl', intercalate, isPrefixOf, break)
-import Data.Either (lefts, rights)
+import Text.Parsec
+import Text.Parsec.String (Parser)
 
 -- =============================================================================
 -- AST Data Types
@@ -37,11 +39,28 @@ data Expr
     | EXor Expr Expr
     | EPolarCoords Expr Expr
     | EAbs Expr
+    | ESin Expr
+    | ECos Expr
+    | EAtan Expr Expr
+    | ELog Expr
+    | ERound Expr
+    | EExpt Expr Expr
+    | EMin Expr Expr
+    | EMax Expr Expr
     | EMandelbrot Expr Expr
     | EJulia Expr Expr Expr
     | ENewton Expr Expr
+    | EIfs Expr Expr Expr Expr
     | EBwNoise Expr Expr
     | EColorNoise Expr Expr
+    | EHsvToRgb Expr Expr Expr
+    | EWarpedBwNoise Expr Expr Expr Expr
+    | EWarpedColorNoise Expr Expr Expr Expr
+    | EBlur Expr
+    | EBandPass Expr
+    | EGradMag Expr
+    | EGradDir Expr
+    | EBump Expr Expr Expr Expr
     deriving (Show, Eq)
 
 data VarName = X | Y deriving (Show, Eq)
@@ -115,6 +134,7 @@ toExpr (SList [SAtom fn]) = parseUnary fn
 toExpr (SList [SAtom fn, a]) = parseBinary1 fn a
 toExpr (SList [SAtom fn, a, b]) = parseBinary2 fn a b
 toExpr (SList [SAtom fn, a, b, c]) = parseTernary fn a b c
+toExpr (SList [SAtom fn, a, b, c, d]) = parseQuaternary fn a b c d
 toExpr (SList xs) = Left $ "Invalid expression form: " ++ show xs
 
 parseAtom' :: String -> Either String Expr
@@ -137,12 +157,28 @@ parseDouble (SAtom s) =
 parseDouble s = Left $ "Expected number atom, got: " ++ show s
 
 parseUnary :: String -> Either String Expr
-parseUnary "abs" = Left "abs requires 1 argument"
-parseUnary fn    = Left $ "Unknown function: " ++ fn
+parseUnary "abs"      = Left "abs requires 1 argument"
+parseUnary "sin"      = Left "sin requires 1 argument"
+parseUnary "cos"      = Left "cos requires 1 argument"
+parseUnary "log"      = Left "log requires 1 argument"
+parseUnary "round"    = Left "round requires 1 argument"
+parseUnary "blur"     = Left "blur requires 1 argument"
+parseUnary "band-pass" = Left "band-pass requires 1 argument"
+parseUnary "grad-mag" = Left "grad-mag requires 1 argument"
+parseUnary "grad-dir" = Left "grad-dir requires 1 argument"
+parseUnary fn         = Left $ "Unknown function: " ++ fn
 
 parseBinary1 :: String -> SExpr -> Either String Expr
-parseBinary1 "abs" a = EAbs <$> toExpr a
-parseBinary1 fn _    = Left $ "Unknown function: " ++ fn
+parseBinary1 "abs"      a = EAbs   <$> toExpr a
+parseBinary1 "sin"      a = ESin   <$> toExpr a
+parseBinary1 "cos"      a = ECos   <$> toExpr a
+parseBinary1 "log"      a = ELog   <$> toExpr a
+parseBinary1 "round"    a = ERound <$> toExpr a
+parseBinary1 "blur"     a = EBlur  <$> toExpr a
+parseBinary1 "band-pass" a = EBandPass <$> toExpr a
+parseBinary1 "grad-mag" a = EGradMag <$> toExpr a
+parseBinary1 "grad-dir" a = EGradDir <$> toExpr a
+parseBinary1 fn _         = Left $ "Unknown function: " ++ fn
 
 parseBinary2 :: String -> SExpr -> SExpr -> Either String Expr
 parseBinary2 "add" a b         = EAdd <$> toExpr a <*> toExpr b
@@ -154,6 +190,10 @@ parseBinary2 "and" a b         = EAnd <$> toExpr a <*> toExpr b
 parseBinary2 "or" a b          = EOr <$> toExpr a <*> toExpr b
 parseBinary2 "xor" a b         = EXor <$> toExpr a <*> toExpr b
 parseBinary2 "polar-coords" a b = EPolarCoords <$> toExpr a <*> toExpr b
+parseBinary2 "atan" a b        = EAtan <$> toExpr a <*> toExpr b
+parseBinary2 "expt" a b        = EExpt <$> toExpr a <*> toExpr b
+parseBinary2 "min" a b         = EMin <$> toExpr a <*> toExpr b
+parseBinary2 "max" a b         = EMax <$> toExpr a <*> toExpr b
 parseBinary2 "mandelbrot" a b  = EMandelbrot <$> toExpr a <*> toExpr b
 parseBinary2 "newton" a b      = ENewton <$> toExpr a <*> toExpr b
 parseBinary2 "bw-noise" a b    = EBwNoise <$> toExpr a <*> toExpr b
@@ -163,7 +203,15 @@ parseBinary2 fn _ _            = Left $ "Unknown function: " ++ fn
 parseTernary :: String -> SExpr -> SExpr -> SExpr -> Either String Expr
 parseTernary "vec" a b c   = EVec <$> parseDouble a <*> parseDouble b <*> parseDouble c
 parseTernary "julia" a b c = EJulia <$> toExpr a <*> toExpr b <*> toExpr c
+parseTernary "hsv-to-rgb" a b c = EHsvToRgb <$> toExpr a <*> toExpr b <*> toExpr c
 parseTernary fn _ _ _       = Left $ "Unknown function: " ++ fn
+
+parseQuaternary :: String -> SExpr -> SExpr -> SExpr -> SExpr -> Either String Expr
+parseQuaternary "warped-bw-noise" a b c d = EWarpedBwNoise <$> toExpr a <*> toExpr b <*> toExpr c <*> toExpr d
+parseQuaternary "warped-color-noise" a b c d = EWarpedColorNoise <$> toExpr a <*> toExpr b <*> toExpr c <*> toExpr d
+parseQuaternary "bump" a b c d = EBump <$> toExpr a <*> toExpr b <*> toExpr c <*> toExpr d
+parseQuaternary "ifs" a b c d = EIfs <$> toExpr a <*> toExpr b <*> toExpr c <*> toExpr d
+parseQuaternary fn _ _ _ _       = Left $ "Unknown function: " ++ fn
 
 -- =============================================================================
 -- Expression to S-Expression (for serialization)
@@ -184,11 +232,28 @@ fromExpr (EOr a b)          = SList [SAtom "or", fromExpr a, fromExpr b]
 fromExpr (EXor a b)         = SList [SAtom "xor", fromExpr a, fromExpr b]
 fromExpr (EPolarCoords a b) = SList [SAtom "polar-coords", fromExpr a, fromExpr b]
 fromExpr (EAbs a)           = SList [SAtom "abs", fromExpr a]
+fromExpr (ESin a)           = SList [SAtom "sin", fromExpr a]
+fromExpr (ECos a)           = SList [SAtom "cos", fromExpr a]
+fromExpr (EAtan a b)        = SList [SAtom "atan", fromExpr a, fromExpr b]
+fromExpr (ELog a)           = SList [SAtom "log", fromExpr a]
+fromExpr (ERound a)         = SList [SAtom "round", fromExpr a]
+fromExpr (EExpt a b)        = SList [SAtom "expt", fromExpr a, fromExpr b]
+fromExpr (EMin a b)         = SList [SAtom "min", fromExpr a, fromExpr b]
+fromExpr (EMax a b)         = SList [SAtom "max", fromExpr a, fromExpr b]
 fromExpr (EMandelbrot a b)  = SList [SAtom "mandelbrot", fromExpr a, fromExpr b]
 fromExpr (EJulia a b c)     = SList [SAtom "julia", fromExpr a, fromExpr b, fromExpr c]
 fromExpr (ENewton a b)      = SList [SAtom "newton", fromExpr a, fromExpr b]
+fromExpr (EIfs a b c d)     = SList [SAtom "ifs", fromExpr a, fromExpr b, fromExpr c, fromExpr d]
 fromExpr (EBwNoise a b)     = SList [SAtom "bw-noise", fromExpr a, fromExpr b]
 fromExpr (EColorNoise a b)  = SList [SAtom "color-noise", fromExpr a, fromExpr b]
+fromExpr (EHsvToRgb a b c)  = SList [SAtom "hsv-to-rgb", fromExpr a, fromExpr b, fromExpr c]
+fromExpr (EWarpedBwNoise a b c d) = SList [SAtom "warped-bw-noise", fromExpr a, fromExpr b, fromExpr c, fromExpr d]
+fromExpr (EWarpedColorNoise a b c d) = SList [SAtom "warped-color-noise", fromExpr a, fromExpr b, fromExpr c, fromExpr d]
+fromExpr (EBlur a)          = SList [SAtom "blur", fromExpr a]
+fromExpr (EBandPass a)      = SList [SAtom "band-pass", fromExpr a]
+fromExpr (EGradMag a)       = SList [SAtom "grad-mag", fromExpr a]
+fromExpr (EGradDir a)       = SList [SAtom "grad-dir", fromExpr a]
+fromExpr (EBump a b c d)    = SList [SAtom "bump", fromExpr a, fromExpr b, fromExpr c, fromExpr d]
 
 showSExpr :: SExpr -> String
 showSExpr (SAtom s) = s
@@ -214,11 +279,11 @@ parseGenotype = do
     spaces
     name <- many1 (noneOf " \t\n\r)")
     spaces
-    _ <- char ')'    -- This closes the name parenthesis
+    _ <- char ')'
     spaces
-    bodyExpr <- parseSExpr'  -- This parses the actual math expression
+    bodyExpr <- parseSExpr'
     spaces
-    _ <- char ')'    -- This closes the outer define parenthesis
+    _ <- char ')'
     spaces
     case toExpr bodyExpr of
         Left err -> fail $ "Invalid body in " ++ name ++ ": " ++ err
@@ -376,6 +441,85 @@ newtonIter initZx initZy =
                                       else go newZxr newZyr (i + 1)
         distSq x1 y1 x2 y2 = (x1-x2)*(x1-x2) + (y1-y2)*(y1-y2)
 
+ifsIter :: Double -> Double -> Double -> Double -> Double -> Double -> Int -> Double
+ifsIter x y a b c d 0 = normalizeSinCos (sin (x * 10.0) + cos (y * 10.0))
+ifsIter x y a b c d n =
+    let ax = abs x
+        ay = abs y
+        (fx, fy) = if ax > ay then (ay, ax) else (ax, ay)
+        nx = a * fx - b * fy + c
+        ny = b * fx + a * fy + d
+        cx = max (-10.0) (min 10.0 nx)
+        cy = max (-10.0) (min 10.0 ny)
+    in ifsIter cx cy a b c d (n - 1)
+
+-- =============================================================================
+-- Safe Math & Color Space Helpers
+-- =============================================================================
+
+normalizeSinCos :: Double -> Double
+normalizeSinCos x = (x + 1.0) / 2.0
+
+normalizeAtan :: Double -> Double
+normalizeAtan x = (x + pi) / (2.0 * pi)
+
+safeLog :: Double -> Double
+safeLog x
+    | x <= 0    = 0
+    | x == 1    = 0
+    | otherwise = log x
+
+safeExpt :: Double -> Double -> Double
+safeExpt base exp
+    | base == 0 && exp > 0 = 0
+    | base < 0             = safeExptPositive (abs base) exp
+    | otherwise            = safeExptPositive base exp
+
+safeExptPositive :: Double -> Double -> Double
+safeExptPositive base exp
+    | result >= 1e10 = 1e10
+    | result <= -1e10 = -1e10
+    | isNaN result || isInfinite result = 0
+    | otherwise = result
+  where
+    result = base ** exp
+
+hsvToRgb :: Double -> Double -> Double -> (Double, Double, Double)
+hsvToRgb h s v
+    | s == 0    = (v, v, v)
+    | otherwise = let h' = h * 6.0
+                      i = floor h' :: Int
+                      f = h' - fromIntegral i
+                      p = v * (1.0 - s)
+                      q = v * (1.0 - s * f)
+                      t = v * (1.0 - s * (1.0 - f))
+                  in case i `mod` 6 of
+                       0 -> (v, t, p)
+                       1 -> (q, v, p)
+                       2 -> (p, v, t)
+                       3 -> (p, q, v)
+                       4 -> (t, p, v)
+                       5 -> (v, p, q)
+                       _ -> (v, v, v)
+
+-- =============================================================================
+-- Image Processing & Analytical Math Helpers
+-- =============================================================================
+
+fdDelta :: Double
+fdDelta = 0.005
+
+evalSafe :: Expr -> Double -> Double -> PixelValue
+evalSafe e x y = case evalExpr e x y of
+    Just v -> v
+    Nothing -> Scalar 0.0
+
+analyticalBlur :: Expr -> Double -> Double -> PixelValue
+analyticalBlur e x y = 
+    let vals = [ evalSafe e (x + dx') (y + dy') | dx' <- [-fdDelta, 0, fdDelta], dy' <- [-fdDelta, 0, fdDelta] ]
+        sumPV = foldl' (binaryOp (+)) (Scalar 0) vals
+    in binaryOp safeDiv sumPV (Scalar 9.0)
+
 -- =============================================================================
 -- Expression Evaluator
 -- =============================================================================
@@ -391,6 +535,14 @@ evalExpr (EMult a b) x y = liftBinary (*) a b x y
 evalExpr (EDiv a b) x y = liftBinary safeDiv a b x y
 evalExpr (EMod a b) x y = liftBinary safeMod a b x y
 evalExpr (EAbs a) x y = do va <- evalExpr a x y; Just (unaryOp abs va)
+evalExpr (ESin a) x y = do va <- evalExpr a x y; Just (unaryOp (normalizeSinCos . sin) va)
+evalExpr (ECos a) x y = do va <- evalExpr a x y; Just (unaryOp (normalizeSinCos . cos) va)
+evalExpr (EAtan a b) x y = liftBinary (\ya xa -> normalizeAtan (atan2 ya xa)) a b x y
+evalExpr (ELog a) x y = do va <- evalExpr a x y; Just (unaryOp safeLog va)
+evalExpr (ERound a) x y = do va <- evalExpr a x y; Just (unaryOp (\v -> fromIntegral (round v :: Integer)) va)
+evalExpr (EExpt a b) x y = liftBinary safeExpt a b x y
+evalExpr (EMin a b) x y = liftBinary min a b x y
+evalExpr (EMax a b) x y = liftBinary max a b x y
 evalExpr (EAnd a b) x y = liftBinary (doubleBitOp (.&.)) a b x y
 evalExpr (EOr a b) x y  = liftBinary (doubleBitOp (.|.)) a b x y
 evalExpr (EXor a b) x y = liftBinary (doubleBitOp xor) a b x y
@@ -422,6 +574,88 @@ evalExpr (ENewton zxExpr zyExpr) x y = do
     let zx = extractScalar vzx; zy = extractScalar vzy
     let (r, g, b) = newtonIter zx zy
     Just (Color r g b)
+evalExpr (EIfs aExpr bExpr cExpr dExpr) x y = do
+    va <- evalExpr aExpr x y; vb <- evalExpr bExpr x y
+    vc <- evalExpr cExpr x y; vd <- evalExpr dExpr x y
+    let a = extractScalar va; b = extractScalar vb
+        c = extractScalar vc; d = extractScalar vd
+    Just (Scalar (ifsIter x y a b c d 8))
+
+-- Color Spaces & Warped Noise
+evalExpr (EHsvToRgb hExpr sExpr vExpr) x y = do
+    vh <- evalExpr hExpr x y; vs <- evalExpr sExpr x y; vv <- evalExpr vExpr x y
+    let h = extractScalar vh; s = extractScalar vs; v = extractScalar vv
+        (r, g, b) = hsvToRgb h s v
+    Just (Color r g b)
+
+evalExpr (EWarpedBwNoise uExpr vExpr fExpr sExpr) x y = do
+    vu <- evalExpr uExpr x y; vv <- evalExpr vExpr x y
+    vf <- evalExpr fExpr x y; vs <- evalExpr sExpr x y
+    let u = extractScalar vu; v = extractScalar vv
+        freq = extractScalar vf; seed = round (extractScalar vs) :: Int
+    Just (Scalar (noise2D (u * freq) (v * freq) seed))
+
+evalExpr (EWarpedColorNoise uExpr vExpr fExpr sExpr) x y = do
+    vu <- evalExpr uExpr x y; vv <- evalExpr vExpr x y
+    vf <- evalExpr fExpr x y; vs <- evalExpr sExpr x y
+    let u = extractScalar vu; v = extractScalar vv
+        freq = extractScalar vf; seed = round (extractScalar vs) :: Int
+        (r, g, b) = colorNoise2D (u * freq) (v * freq) seed
+    Just (Color r g b)
+
+-- Image Processing (Analytical)
+evalExpr (EBlur a) x y = Just (analyticalBlur a x y)
+
+evalExpr (EBandPass a) x y = 
+    let largeDelta = 0.05 
+        lowVals = [ evalSafe a (x + dx') (y + dy') | dx' <- [-largeDelta, 0, largeDelta], dy' <- [-largeDelta, 0, largeDelta] ]
+        lowPV = foldl' (binaryOp (+)) (Scalar 0) lowVals
+        lowFreq = binaryOp safeDiv lowPV (Scalar 9.0)
+        
+        highFreq = analyticalBlur a x y
+        
+        diff = binaryOp (-) highFreq lowFreq
+    in Just (binaryOp (*) diff (Scalar 5.0)) 
+
+evalExpr (EGradMag a) x y = 
+    let va_p = evalSafe a (x + fdDelta) y
+        va_m = evalSafe a (x - fdDelta) y
+        va_u = evalSafe a x (y + fdDelta)
+        va_d = evalSafe a x (y - fdDelta)
+        gx = binaryOp (-) va_p va_m
+        gy = binaryOp (-) va_u va_d
+        gx2 = binaryOp (*) gx gx
+        gy2 = binaryOp (*) gy gy
+        sumSq = binaryOp (+) gx2 gy2
+        mag = unaryOp sqrt sumSq
+        normMag = unaryOp (/ (2.0 * fdDelta)) mag
+    in Just (unaryOp (min 1.0) normMag)
+
+evalExpr (EGradDir a) x y = 
+    let gx = extractScalar (evalSafe a (x + fdDelta) y) - extractScalar (evalSafe a (x - fdDelta) y)
+        gy = extractScalar (evalSafe a x (y + fdDelta)) - extractScalar (evalSafe a x (y - fdDelta))
+        angle = atan2 gy gx
+        norm = (angle + pi) / (2.0 * pi)
+    in Just (Scalar norm)
+
+evalExpr (EBump imgExpr lxExpr lyExpr lzExpr) x y = 
+    let baseColor = evalSafe imgExpr x y
+        bumpDelta = 0.05 
+        gx = extractScalar (evalSafe imgExpr (x + bumpDelta) y) - extractScalar (evalSafe imgExpr (x - bumpDelta) y)
+        gy = extractScalar (evalSafe imgExpr x (y + bumpDelta)) - extractScalar (evalSafe imgExpr x (y - bumpDelta))
+        surfaceScale = 15.0 
+        nx = -gx * surfaceScale; ny = -gy * surfaceScale; nz = 1.0
+        nLen = sqrt (nx*nx + ny*ny + nz*nz)
+        nnx = nx/nLen; nny = ny/nLen; nnz = nz/nLen
+        vlx = extractScalar (evalSafe lxExpr x y)
+        vly = extractScalar (evalSafe lyExpr x y)
+        vlz = extractScalar (evalSafe lzExpr x y)
+        lLen = sqrt (vlx*vlx + vly*vly + vlz*vlz)
+    in if lLen < 0.0001 
+       then Just baseColor 
+       else let llx = vlx/lLen; lly = vly/lLen; llz = vlz/lLen
+                dot = max 0.0 (nnx*llx + nny*lly + nnz*llz)
+            in Just (binaryOp (*) baseColor (Scalar dot))
 
 liftBinary :: (Double -> Double -> Double) -> Expr -> Expr -> Double -> Double -> Maybe PixelValue
 liftBinary f a b x y = do
@@ -439,8 +673,8 @@ toPixelRGB8 :: PixelValue -> PixelRGB8
 toPixelRGB8 (Scalar s) = PixelRGB8 (toByte s) (toByte s) (toByte s)
 toPixelRGB8 (Color r g b) = PixelRGB8 (toByte r) (toByte g) (toByte b)
 
-renderExpr :: Config -> Expr -> Either String (Image PixelRGB8)
-renderExpr cfg expr = Right $ generateImage pixelFn (width cfg) (height cfg)
+renderExpr :: Config -> Expr -> IO (Either String (Image PixelRGB8))
+renderExpr cfg expr = return $ Right $ generateImageParallel pixelFn (width cfg) (height cfg)
   where
     w = width cfg
     h = height cfg
@@ -458,7 +692,8 @@ renderExpr cfg expr = Right $ generateImage pixelFn (width cfg) (height cfg)
 
     aaPixel px py = 
       let offsets = [ (0.25, 0.25), (0.75, 0.25)
-                    , (0.25, 0.75), (0.75, 0.75) ]
+                , (0.25, 0.0), (0.75, 0.0) 
+                , (0.25, 1.0), (0.75, 1.0) ]
           samples = [ evalNorm (normX (fromIntegral px + dx)) (normY (fromIntegral py + dy)) 
                     | (dx, dy) <- offsets ]
       in averagePixel samples
@@ -475,6 +710,19 @@ renderExpr cfg expr = Right $ generateImage pixelFn (width cfg) (height cfg)
 
     accumulate (r, g, b, c) (Scalar s) = (r + s, g + s, b + s, c + 1)
     accumulate (r, g, b, c) (Color cr cg cb) = (r + cr, g + cg, b + cb, c + 1)
+
+-- | Splits image generation by row, evaluating strictly in parallel across all CPU cores
+generateImageParallel :: (Int -> Int -> PixelRGB8) -> Int -> Int -> Image PixelRGB8
+generateImageParallel gen w h = 
+    let rows = map genRow [0..h-1]
+        genRow y = V.generate (w * 3) $ \i ->
+            let (PixelRGB8 r g b) = gen (i `div` 3) y
+            in case i `mod` 3 of
+                 0 -> r
+                 1 -> g
+                 _ -> b
+        parallelRows = rows `using` parList rseq
+    in Image w h (V.concat parallelRows)
 
 -- =============================================================================
 -- Random Helpers
@@ -504,12 +752,15 @@ randomExpr g depth =
     let (isLeaf, g1) = randomR (0, 3 :: Int) g
     in if isLeaf == 0
        then randomLeaf g1
-       else let (fnIdx, g2) = randomR (0, 13 :: Int) g1
-            in if fnIdx < 1 
+       else let (fnIdx, g2) = randomR (0, 30 :: Int) g1
+            in if fnIdx < 9        -- 9 Unaries
                then randomUnary g2 depth
-               else if fnIdx < 13
+               else if fnIdx < 25   -- 16 Binaries
                then randomBinary g2 depth
-               else randomJulia g2 depth
+               else if fnIdx < 27   -- 2 Ternaries
+               then randomTernary g2 depth
+               else                 -- 4 Quaternaries
+                    randomQuaternary g2 depth
 
 randomLeaf :: StdGen -> (Expr, StdGen)
 randomLeaf g =
@@ -527,23 +778,58 @@ randomLeaf g =
     (cb, g5) = randomR (0.0, 1.0) g4
 
 randomUnary :: StdGen -> Int -> (Expr, StdGen)
-randomUnary g depth = let (a, g1) = randomExpr g (depth - 1) in (EAbs a, g1)
+randomUnary g depth =
+    let (idx, g1) = randomR (0, 8 :: Int) g
+        (a, g2) = randomExpr g1 (depth - 1)
+    in case idx of
+        0 -> (EAbs a, g2)
+        1 -> (ESin a, g2)
+        2 -> (ECos a, g2)
+        3 -> (ELog a, g2)
+        4 -> (ERound a, g2)
+        5 -> (EBlur a, g2)
+        6 -> (EBandPass a, g2)
+        7 -> (EGradMag a, g2)
+        8 -> (EGradDir a, g2)
+        _ -> (EAbs a, g2)
 
 randomBinary :: StdGen -> Int -> (Expr, StdGen)
 randomBinary g depth =
-    let fns = [EAdd, ESub, EMult, EDiv, EMod, EAnd, EOr, EXor, EPolarCoords, EMandelbrot, ENewton, EBwNoise, EColorNoise]
+    let fns = [ EAdd, ESub, EMult, EDiv, EMod
+              , EAnd, EOr, EXor
+              , EPolarCoords
+              , EAtan, EExpt, EMin, EMax
+              , EMandelbrot, ENewton, EBwNoise, EColorNoise ]
         (idx, g1) = randomR (0, length fns - 1) g
         fn = fns !! idx
         (a, g2) = randomExpr g1 (depth - 1)
         (b, g3) = randomExpr g2 (depth - 1)
     in (fn a b, g3)
 
-randomJulia :: StdGen -> Int -> (Expr, StdGen)
-randomJulia g depth =
-    let (a, g1) = randomExpr g (depth - 1)
-        (b, g2) = randomExpr g1 (depth - 1)
-        (c, g3) = randomLeaf g2 
-    in (EJulia a b c, g3)
+randomTernary :: StdGen -> Int -> (Expr, StdGen)
+randomTernary g depth =
+    let (idx, g1) = randomR (0, 1 :: Int) g
+        (a, g2) = randomExpr g1 (depth - 1)
+        (b, g3) = randomExpr g2 (depth - 1)
+        (c, g4) = randomExpr g3 (depth - 1)
+    in case idx of
+        0 -> (EJulia a b c, g4)
+        1 -> (EHsvToRgb a b c, g4)
+        _ -> (EJulia a b c, g4)
+
+randomQuaternary :: StdGen -> Int -> (Expr, StdGen)
+randomQuaternary g depth =
+    let (idx, g1) = randomR (0, 3 :: Int) g
+        (a, g2) = randomExpr g1 (depth - 1)
+        (b, g3) = randomExpr g2 (depth - 1)
+        (c, g4) = randomExpr g3 (depth - 1)
+        (d, g5) = randomExpr g4 (depth - 1)
+    in case idx of
+        0 -> (EWarpedBwNoise a b c d, g5)
+        1 -> (EWarpedColorNoise a b c d, g5)
+        2 -> (EBump a b c d, g5)
+        3 -> (EIfs a b c d, g5)
+        _ -> (EIfs a b c d, g5)
 
 generatePopulation :: Config -> IO Population
 generatePopulation cfg = do
@@ -563,44 +849,78 @@ generatePopulation cfg = do
 -- =============================================================================
 
 sizeExpr :: Expr -> Int
-sizeExpr (EConst _)     = 1
-sizeExpr (EVec _ _ _)   = 1
-sizeExpr (EVar _)       = 1
-sizeExpr (EAbs a)       = 1 + sizeExpr a
-sizeExpr (EAdd a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (ESub a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EMult a b)    = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EDiv a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EMod a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EAnd a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EOr a b)      = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EXor a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EPolarCoords a b) = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EMandelbrot a b)  = 1 + sizeExpr a + sizeExpr b
-sizeExpr (ENewton a b)      = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EBwNoise a b)     = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EColorNoise a b)  = 1 + sizeExpr a + sizeExpr b
-sizeExpr (EJulia a b c)     = 1 + sizeExpr a + sizeExpr b + sizeExpr c
+sizeExpr (EConst _)           = 1
+sizeExpr (EVec _ _ _)         = 1
+sizeExpr (EVar _)             = 1
+sizeExpr (EAbs a)             = 1 + sizeExpr a
+sizeExpr (ESin a)             = 1 + sizeExpr a
+sizeExpr (ECos a)             = 1 + sizeExpr a
+sizeExpr (ELog a)             = 1 + sizeExpr a
+sizeExpr (ERound a)           = 1 + sizeExpr a
+sizeExpr (EBlur a)            = 1 + sizeExpr a
+sizeExpr (EBandPass a)        = 1 + sizeExpr a
+sizeExpr (EGradMag a)         = 1 + sizeExpr a
+sizeExpr (EGradDir a)         = 1 + sizeExpr a
+sizeExpr (EAdd a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (ESub a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMult a b)          = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EDiv a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMod a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EAnd a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EOr a b)            = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EXor a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EPolarCoords a b)   = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EAtan a b)          = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EExpt a b)          = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMin a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMax a b)           = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EMandelbrot a b)    = 1 + sizeExpr a + sizeExpr b
+sizeExpr (ENewton a b)        = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EIfs a b c d)       = 1 + sizeExpr a + sizeExpr b + sizeExpr c + sizeExpr d
+sizeExpr (EBwNoise a b)       = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EColorNoise a b)    = 1 + sizeExpr a + sizeExpr b
+sizeExpr (EJulia a b c)       = 1 + sizeExpr a + sizeExpr b + sizeExpr c
+sizeExpr (EHsvToRgb a b c)    = 1 + sizeExpr a + sizeExpr b + sizeExpr c
+sizeExpr (EWarpedBwNoise a b c d)    = 1 + sizeExpr a + sizeExpr b + sizeExpr c + sizeExpr d
+sizeExpr (EWarpedColorNoise a b c d) = 1 + sizeExpr a + sizeExpr b + sizeExpr c + sizeExpr d
+sizeExpr (EBump a b c d)      = 1 + sizeExpr a + sizeExpr b + sizeExpr c + sizeExpr d
 
 getAllNodes :: Expr -> [Expr]
-getAllNodes e@(EConst _)     = [e]
-getAllNodes e@(EVec _ _ _)   = [e]
-getAllNodes e@(EVar _)       = [e]
-getAllNodes e@(EAbs a)       = e : getAllNodes a
-getAllNodes e@(EAdd a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(ESub a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EMult a b)    = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EDiv a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EMod a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EAnd a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EOr a b)      = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EXor a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EPolarCoords a b) = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EMandelbrot a b)  = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(ENewton a b)      = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EBwNoise a b)     = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EColorNoise a b)  = e : getAllNodes a ++ getAllNodes b
-getAllNodes e@(EJulia a b c)     = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c
+getAllNodes e@(EConst _)           = [e]
+getAllNodes e@(EVec _ _ _)         = [e]
+getAllNodes e@(EVar _)             = [e]
+getAllNodes e@(EAbs a)             = e : getAllNodes a
+getAllNodes e@(ESin a)             = e : getAllNodes a
+getAllNodes e@(ECos a)             = e : getAllNodes a
+getAllNodes e@(ELog a)             = e : getAllNodes a
+getAllNodes e@(ERound a)           = e : getAllNodes a
+getAllNodes e@(EBlur a)            = e : getAllNodes a
+getAllNodes e@(EBandPass a)        = e : getAllNodes a
+getAllNodes e@(EGradMag a)         = e : getAllNodes a
+getAllNodes e@(EGradDir a)         = e : getAllNodes a
+getAllNodes e@(EAdd a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(ESub a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMult a b)          = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EDiv a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMod a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EAnd a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EOr a b)            = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EXor a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EPolarCoords a b)   = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EAtan a b)          = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EExpt a b)          = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMin a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMax a b)           = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EMandelbrot a b)    = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(ENewton a b)        = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EIfs a b c d)       = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c ++ getAllNodes d
+getAllNodes e@(EBwNoise a b)       = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EColorNoise a b)    = e : getAllNodes a ++ getAllNodes b
+getAllNodes e@(EJulia a b c)       = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c
+getAllNodes e@(EHsvToRgb a b c)    = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c
+getAllNodes e@(EWarpedBwNoise a b c d)    = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c ++ getAllNodes d
+getAllNodes e@(EWarpedColorNoise a b c d) = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c ++ getAllNodes d
+getAllNodes e@(EBump a b c d)      = e : getAllNodes a ++ getAllNodes b ++ getAllNodes c ++ getAllNodes d
 
 clamp01 :: Double -> Double
 clamp01 v = max 0.0 (min 1.0 v)
@@ -615,24 +935,41 @@ mutateExpr g baseRate expr =
        else mutateChildren g1 baseRate expr
 
 mutateChildren :: StdGen -> Int -> Expr -> (Expr, StdGen)
-mutateChildren g _ e@(EConst _)     = (e, g)
-mutateChildren g _ e@(EVec _ _ _)   = (e, g)
-mutateChildren g _ e@(EVar _)       = (e, g)
-mutateChildren g r (EAbs a)       = let (a', g1) = mutateExpr g r a in (EAbs a', g1)
-mutateChildren g r (EAdd a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAdd a' b', g2)
-mutateChildren g r (ESub a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ESub a' b', g2)
-mutateChildren g r (EMult a b)    = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMult a' b', g2)
-mutateChildren g r (EDiv a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EDiv a' b', g2)
-mutateChildren g r (EMod a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMod a' b', g2)
-mutateChildren g r (EAnd a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAnd a' b', g2)
-mutateChildren g r (EOr a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EOr a' b', g2)
-mutateChildren g r (EXor a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EXor a' b', g2)
-mutateChildren g r (EPolarCoords a b) = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EPolarCoords a' b', g2)
-mutateChildren g r (EMandelbrot a b)  = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMandelbrot a' b', g2)
-mutateChildren g r (ENewton a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ENewton a' b', g2)
-mutateChildren g r (EBwNoise a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EBwNoise a' b', g2)
-mutateChildren g r (EColorNoise a b)  = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EColorNoise a' b', g2)
-mutateChildren g r (EJulia a b c)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c in (EJulia a' b' c', g3)
+mutateChildren g _ e@(EConst _)           = (e, g)
+mutateChildren g _ e@(EVec _ _ _)         = (e, g)
+mutateChildren g _ e@(EVar _)             = (e, g)
+mutateChildren g r (EAbs a)               = let (a', g1) = mutateExpr g r a in (EAbs a', g1)
+mutateChildren g r (ESin a)               = let (a', g1) = mutateExpr g r a in (ESin a', g1)
+mutateChildren g r (ECos a)               = let (a', g1) = mutateExpr g r a in (ECos a', g1)
+mutateChildren g r (ELog a)               = let (a', g1) = mutateExpr g r a in (ELog a', g1)
+mutateChildren g r (ERound a)             = let (a', g1) = mutateExpr g r a in (ERound a', g1)
+mutateChildren g r (EBlur a)              = let (a', g1) = mutateExpr g r a in (EBlur a', g1)
+mutateChildren g r (EBandPass a)          = let (a', g1) = mutateExpr g r a in (EBandPass a', g1)
+mutateChildren g r (EGradMag a)           = let (a', g1) = mutateExpr g r a in (EGradMag a', g1)
+mutateChildren g r (EGradDir a)           = let (a', g1) = mutateExpr g r a in (EGradDir a', g1)
+mutateChildren g r (EAdd a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAdd a' b', g2)
+mutateChildren g r (ESub a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ESub a' b', g2)
+mutateChildren g r (EMult a b)            = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMult a' b', g2)
+mutateChildren g r (EDiv a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EDiv a' b', g2)
+mutateChildren g r (EMod a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMod a' b', g2)
+mutateChildren g r (EAnd a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAnd a' b', g2)
+mutateChildren g r (EOr a b)              = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EOr a' b', g2)
+mutateChildren g r (EXor a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EXor a' b', g2)
+mutateChildren g r (EPolarCoords a b)     = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EPolarCoords a' b', g2)
+mutateChildren g r (EAtan a b)            = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EAtan a' b', g2)
+mutateChildren g r (EExpt a b)            = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EExpt a' b', g2)
+mutateChildren g r (EMin a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMin a' b', g2)
+mutateChildren g r (EMax a b)             = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMax a' b', g2)
+mutateChildren g r (EMandelbrot a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EMandelbrot a' b', g2)
+mutateChildren g r (ENewton a b)          = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (ENewton a' b', g2)
+mutateChildren g r (EIfs a b c d)         = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c; (d', g4) = mutateExpr g3 r d in (EIfs a' b' c' d', g4)
+mutateChildren g r (EBwNoise a b)         = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EBwNoise a' b', g2)
+mutateChildren g r (EColorNoise a b)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b in (EColorNoise a' b', g2)
+mutateChildren g r (EJulia a b c)         = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c in (EJulia a' b' c', g3)
+mutateChildren g r (EHsvToRgb a b c)      = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c in (EHsvToRgb a' b' c', g3)
+mutateChildren g r (EWarpedBwNoise a b c d)    = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c; (d', g4) = mutateExpr g3 r d in (EWarpedBwNoise a' b' c' d', g4)
+mutateChildren g r (EWarpedColorNoise a b c d) = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c; (d', g4) = mutateExpr g3 r d in (EWarpedColorNoise a' b' c' d', g4)
+mutateChildren g r (EBump a b c d)        = let (a', g1) = mutateExpr g r a; (b', g2) = mutateExpr g1 r b; (c', g3) = mutateExpr g2 r c; (d', g4) = mutateExpr g3 r d in (EBump a' b' c' d', g4)
 
 applyRandomMutation :: StdGen -> Int -> Expr -> (Expr, StdGen)
 applyRandomMutation g rate expr =
@@ -658,252 +995,177 @@ applyRandomMutation g rate expr =
                      in (nodes !! idx, g2)
                 else (expr, g1)
 
+applySwapped :: Either (Expr -> Expr) (Expr -> Expr -> Expr) -> [Expr] -> StdGen -> (Expr, StdGen)
+applySwapped (Left f) [a, _] g = (f a, g)
+applySwapped (Left f) [a] g = (f a, g)
+applySwapped (Right f) [a] g = let (b, g1) = randomLeaf g in (f a b, g1)
+applySwapped (Right f) [a, b] g = (f a b, g)
+applySwapped _ _ g = (EConst 0, g)
+
 swapFunction :: StdGen -> Expr -> (Expr, StdGen)
-swapFunction g (EAbs a) = (EAbs a, g)
 swapFunction g expr =
-    let fns = [EAdd, ESub, EMult, EDiv, EMod, EAnd, EOr, EXor, EPolarCoords, EMandelbrot, ENewton, EBwNoise, EColorNoise]
-        (idx, g1) = randomR (0, length fns - 1) g
-        fn = fns !! idx
+    let unaries = [EAbs, ESin, ECos, ELog, ERound, EBlur, EBandPass, EGradMag, EGradDir]
+        binaries = [EAdd, ESub, EMult, EDiv, EMod, EAnd, EOr, EXor, EPolarCoords, EAtan, EExpt, EMin, EMax, EMandelbrot, ENewton, EBwNoise, EColorNoise]
+        allFns = map Left unaries ++ map Right binaries
+        (idx, g1) = randomR (0, length allFns - 1) g
+        fn = allFns !! idx
     in case expr of
-        EAdd a b       -> (fn a b, g1)
-        ESub a b       -> (fn a b, g1)
-        EMult a b      -> (fn a b, g1)
-        EDiv a b       -> (fn a b, g1)
-        EMod a b       -> (fn a b, g1)
-        EAnd a b       -> (fn a b, g1)
-        EOr a b        -> (fn a b, g1)
-        EXor a b       -> (fn a b, g1)
-        EPolarCoords a b -> (fn a b, g1)
-        EMandelbrot a b  -> (fn a b, g1)
-        ENewton a b      -> (fn a b, g1)
-        EBwNoise a b     -> (fn a b, g1)
-        EColorNoise a b  -> (fn a b, g1)
-        _                -> (expr, g)
+        EAbs a             -> applySwapped fn [a] g1
+        ESin a             -> applySwapped fn [a] g1
+        ECos a             -> applySwapped fn [a] g1
+        ELog a             -> applySwapped fn [a] g1
+        ERound a           -> applySwapped fn [a] g1
+        EBlur a            -> applySwapped fn [a] g1
+        EBandPass a        -> applySwapped fn [a] g1
+        EGradMag a         -> applySwapped fn [a] g1
+        EGradDir a         -> applySwapped fn [a] g1
+        EAdd a b           -> applySwapped fn [a, b] g1
+        ESub a b           -> applySwapped fn [a, b] g1
+        EMult a b          -> applySwapped fn [a, b] g1
+        EDiv a b           -> applySwapped fn [a, b] g1
+        EMod a b           -> applySwapped fn [a, b] g1
+        EAnd a b           -> applySwapped fn [a, b] g1
+        EOr a b            -> applySwapped fn [a, b] g1
+        EXor a b           -> applySwapped fn [a, b] g1
+        EPolarCoords a b   -> applySwapped fn [a, b] g1
+        EAtan a b          -> applySwapped fn [a, b] g1
+        EExpt a b          -> applySwapped fn [a, b] g1
+        EMin a b           -> applySwapped fn [a, b] g1
+        EMax a b           -> applySwapped fn [a, b] g1
+        EMandelbrot a b    -> applySwapped fn [a, b] g1
+        ENewton a b        -> applySwapped fn [a, b] g1
+        EBwNoise a b       -> applySwapped fn [a, b] g1
+        EColorNoise a b    -> applySwapped fn [a, b] g1
+        _                  -> (expr, g)
 
 wrapInFunction :: StdGen -> Expr -> (Expr, StdGen)
 wrapInFunction g expr =
-    let (wType, g1) = randomR (0, 2 :: Int) g
+    let (wType, g1) = randomR (0, 10 :: Int) g
     in case wType of
         0 -> (EAbs expr, g1)
-        1 -> let (leaf, g2) = randomLeaf g1 in (EAdd expr leaf, g2)
-        2 -> let (leaf, g2) = randomLeaf g1 in (EMult expr leaf, g2)
+        1 -> (ESin expr, g1)
+        2 -> (ECos expr, g1)
+        3 -> (ELog expr, g1)
+        4 -> (ERound expr, g1)
+        5 -> (EBlur expr, g1)
+        6 -> (EBandPass expr, g1)
+        7 -> (EGradMag expr, g1)
+        8 -> (EGradDir expr, g1)
+        9 -> let (leaf, g2) = randomLeaf g1 in (EAdd expr leaf, g2)
+        10 -> let (leaf, g2) = randomLeaf g1 in (EMult expr leaf, g2)
         _ -> (EAbs expr, g1)
 
 unwrapFunction :: StdGen -> Expr -> (Expr, StdGen)
-unwrapFunction g (EAbs a) = (a, g)
-unwrapFunction g (EJulia a b c) = 
-    let (idx, g1) = randomR (0, 2 :: Int) g
-    in ([a, b, c] !! idx, g1)
+unwrapFunction g (EAbs a)               = (a, g)
+unwrapFunction g (ESin a)               = (a, g)
+unwrapFunction g (ECos a)               = (a, g)
+unwrapFunction g (ELog a)               = (a, g)
+unwrapFunction g (ERound a)             = (a, g)
+unwrapFunction g (EBlur a)              = (a, g)
+unwrapFunction g (EBandPass a)          = (a, g)
+unwrapFunction g (EGradMag a)           = (a, g)
+unwrapFunction g (EGradDir a)           = (a, g)
+unwrapFunction g (EJulia a b c)         = let (idx, g1) = randomR (0, 2 :: Int) g in ([a, b, c] !! idx, g1)
+unwrapFunction g (EHsvToRgb a b c)      = let (idx, g1) = randomR (0, 2 :: Int) g in ([a, b, c] !! idx, g1)
+unwrapFunction g (EIfs a b c d)         = let (idx, g1) = randomR (0, 3 :: Int) g in ([a, b, c, d] !! idx, g1)
+unwrapFunction g (EWarpedBwNoise a b c d)    = let (idx, g1) = randomR (0, 3 :: Int) g in ([a, b, c, d] !! idx, g1)
+unwrapFunction g (EWarpedColorNoise a b c d) = let (idx, g1) = randomR (0, 3 :: Int) g in ([a, b, c, d] !! idx, g1)
+unwrapFunction g (EBump a b c d)        = let (idx, g1) = randomR (0, 3 :: Int) g in ([a, b, c, d] !! idx, g1)
 unwrapFunction g expr =
     let (idx, g1) = randomR (0, 1 :: Int) g
     in case expr of
-        EAdd a b       -> (if idx == 0 then a else b, g1)
-        ESub a b       -> (if idx == 0 then a else b, g1)
-        EMult a b      -> (if idx == 0 then a else b, g1)
-        EDiv a b       -> (if idx == 0 then a else b, g1)
-        EMod a b       -> (if idx == 0 then a else b, g1)
-        EAnd a b       -> (if idx == 0 then a else b, g1)
-        EOr a b        -> (if idx == 0 then a else b, g1)
-        EXor a b       -> (if idx == 0 then a else b, g1)
-        EPolarCoords a b -> (if idx == 0 then a else b, g1)
-        EMandelbrot a b  -> (if idx == 0 then a else b, g1)
-        ENewton a b      -> (if idx == 0 then a else b, g1)
-        EBwNoise a b     -> (if idx == 0 then a else b, g1)
-        EColorNoise a b  -> (if idx == 0 then a else b, g1)
-        _                -> (expr, g)
+        EAdd a b           -> (if idx == 0 then a else b, g1)
+        ESub a b           -> (if idx == 0 then a else b, g1)
+        EMult a b          -> (if idx == 0 then a else b, g1)
+        EDiv a b           -> (if idx == 0 then a else b, g1)
+        EMod a b           -> (if idx == 0 then a else b, g1)
+        EAnd a b           -> (if idx == 0 then a else b, g1)
+        EOr a b            -> (if idx == 0 then a else b, g1)
+        EXor a b           -> (if idx == 0 then a else b, g1)
+        EPolarCoords a b   -> (if idx == 0 then a else b, g1)
+        EAtan a b          -> (if idx == 0 then a else b, g1)
+        EExpt a b          -> (if idx == 0 then a else b, g1)
+        EMin a b           -> (if idx == 0 then a else b, g1)
+        EMax a b           -> (if idx == 0 then a else b, g1)
+        EMandelbrot a b    -> (if idx == 0 then a else b, g1)
+        ENewton a b        -> (if idx == 0 then a else b, g1)
+        EBwNoise a b       -> (if idx == 0 then a else b, g1)
+        EColorNoise a b    -> (if idx == 0 then a else b, g1)
+        _                  -> (expr, g)
 
 -- =============================================================================
--- Breeding / Crossover Operations
+-- CLI Parser & Main Execution
 -- =============================================================================
-
-type Path = [Int]
-
-getAllPaths :: Expr -> [(Path, Expr)]
-getAllPaths e = [([], e)] ++ children
-  where
-    children = case e of
-        EConst _     -> []
-        EVec _ _ _   -> []
-        EVar _       -> []
-        EAbs a       -> map (\(p, n) -> (0:p, n)) (getAllPaths a)
-        EJulia a b c -> map (\(p, n) -> (0:p, n)) (getAllPaths a) 
-                     ++ map (\(p, n) -> (1:p, n)) (getAllPaths b) 
-                     ++ map (\(p, n) -> (2:p, n)) (getAllPaths c)
-        _ -> let (a, b) = getBinaryArgs e
-             in map (\(p, n) -> (0:p, n)) (getAllPaths a) 
-             ++ map (\(p, n) -> (1:p, n)) (getAllPaths b)
-
-getBinaryArgs :: Expr -> (Expr, Expr)
-getBinaryArgs (EAdd a b) = (a, b)
-getBinaryArgs (ESub a b) = (a, b)
-getBinaryArgs (EMult a b) = (a, b)
-getBinaryArgs (EDiv a b) = (a, b)
-getBinaryArgs (EMod a b) = (a, b)
-getBinaryArgs (EAnd a b) = (a, b)
-getBinaryArgs (EOr a b) = (a, b)
-getBinaryArgs (EXor a b) = (a, b)
-getBinaryArgs (EPolarCoords a b) = (a, b)
-getBinaryArgs (EMandelbrot a b) = (a, b)
-getBinaryArgs (ENewton a b) = (a, b)
-getBinaryArgs (EBwNoise a b) = (a, b)
-getBinaryArgs (EColorNoise a b) = (a, b)
-
-replaceAt :: Expr -> Path -> Expr -> Maybe Expr
-replaceAt _ [] new = Just new
-replaceAt e (0:ps) new = case e of
-    EAbs a -> EAbs <$> replaceAt a ps new
-    EJulia a b c -> (\a' -> EJulia a' b c) <$> replaceAt a ps new
-    _ -> let (a, b) = getBinaryArgs e
-             fn = constructorOf e
-         in (\a' -> fn a' b) <$> replaceAt a ps new
-replaceAt e (1:ps) new = case e of
-    EJulia a b c -> (\b' -> EJulia a b' c) <$> replaceAt b ps new
-    _ -> let (a, b) = getBinaryArgs e
-             fn = constructorOf e
-         in (\b' -> fn a b') <$> replaceAt b ps new
-replaceAt e (2:ps) new = case e of
-    EJulia a b c -> (\c' -> EJulia a b c') <$> replaceAt c ps new
-    _ -> Nothing
-replaceAt _ _ _ = Nothing
-
-constructorOf :: Expr -> (Expr -> Expr -> Expr)
-constructorOf (EAdd _ _) = EAdd
-constructorOf (ESub _ _) = ESub
-constructorOf (EMult _ _) = EMult
-constructorOf (EDiv _ _) = EDiv
-constructorOf (EMod _ _) = EMod
-constructorOf (EAnd _ _) = EAnd
-constructorOf (EOr _ _) = EOr
-constructorOf (EXor _ _) = EXor
-constructorOf (EPolarCoords _ _) = EPolarCoords
-constructorOf (EMandelbrot _ _) = EMandelbrot
-constructorOf (ENewton _ _) = ENewton
-constructorOf (EBwNoise _ _) = EBwNoise
-constructorOf (EColorNoise _ _) = EColorNoise
-
-breedPair :: StdGen -> Int -> Expr -> Expr -> (Expr, StdGen)
-breedPair g rate p1 p2 =
-    let paths1 = getAllPaths p1
-        paths2 = getAllPaths p2
-        (idx1, g1) = randomR (0, length paths1 - 1) g
-        (idx2, g2) = randomR (0, length paths2 - 1) g1
-        (path1, _) = paths1 !! idx1
-        (_, sub2)  = paths2 !! idx2
-        child = case replaceAt p1 path1 sub2 of
-                  Just c -> c
-                  Nothing -> p1
-    in mutateExpr g2 rate child
-
--- =============================================================================
--- CLI Argument Parsing
--- =============================================================================
-
-parseSize :: String -> Either String (Int, Int)
-parseSize s = case break (== 'x') s of
-    (w, 'x':h) -> case (reads w, reads h) of
-        ([(w', "")], [(h', "")]) -> Right (w', h')
-        _ -> Left $ "Invalid size format: " ++ s
-    _ -> Left $ "Invalid size format (missing 'x'): " ++ s
 
 parseArgs :: [String] -> Either String Config
-parseArgs args = foldM parseOne defaultConfig args
+parseArgs args = go args defaultConfig
   where
-    parseOne cfg "--generate" = Right cfg { cmd = Generate }
-    parseOne cfg "--breed"    = Right cfg { cmd = Breed }
-    parseOne cfg "--render"   = Right cfg { cmd = Render }
-    
-    parseOne cfg ('-':'d':ds) = case reads ds of
-        [(d, "")] -> Right cfg { depth = d }
-        _ -> Left $ "Invalid depth: " ++ ds
-        
-    parseOne cfg ('-':'m':ds) = case reads ds of
-        [(m, "")] -> Right cfg { mutation = m }
-        _ -> Left $ "Invalid mutation rate: " ++ ds
-        
-    parseOne cfg ('-':'g':ds) = case reads ds of
-        [(g, "")] -> Right cfg { genSize = g }
-        _ -> Left $ "Invalid generation size: " ++ ds
-        
-    parseOne cfg "-aa0" = Right cfg { aa = False }
-    parseOne cfg "-aa1" = Right cfg { aa = True }
-    parseOne cfg ('-':'a':'a':ds)   = Left $ "Invalid anti-aliasing flag: " ++ ds
-    
-    parseOne cfg ('-':'s':ds) = case parseSize ds of
-        Right (w, h) -> Right cfg { width = w, height = h }
-        Left err -> Left err
-        
-    parseOne cfg f = Right cfg { srcFiles = srcFiles cfg ++ [f] }
-
--- =============================================================================
--- Command Execution
--- =============================================================================
+    go [] cfg = Right cfg
+    go ("--generate":rest) cfg = go rest cfg { cmd = Generate }
+    go ("--render":rest) cfg = go rest cfg { cmd = Render }
+    go ("--breed":rest) cfg = go rest cfg { cmd = Breed }
+    go (arg:rest) cfg
+      | "--generate" `isPrefixOf` arg = go rest cfg { cmd = Generate }
+      | "--render" `isPrefixOf` arg = go rest cfg { cmd = Render }
+      | "--breed" `isPrefixOf` arg = go rest cfg { cmd = Breed }
+      | "-d" `isPrefixOf` arg = case reads (drop 2 arg) of
+          [(d, "")] -> go rest cfg { depth = d }
+          _ -> Left "Invalid depth"
+      | "-m" `isPrefixOf` arg = case reads (drop 2 arg) of
+          [(m, "")] -> go rest cfg { mutation = m }
+          _ -> Left "Invalid mutation rate"
+      | "-g" `isPrefixOf` arg = case reads (drop 2 arg) of
+          [(g, "")] -> go rest cfg { genSize = g }
+          _ -> Left "Invalid generation size"
+      | "-s" `isPrefixOf` arg = case break (== 'x') (drop 2 arg) of
+          (wStr, 'x':hStr) -> case (reads wStr, reads hStr) of
+              ([(w, "")], [(h, "")]) -> go rest cfg { width = w, height = h }
+              _ -> Left "Invalid dimensions"
+          _ -> Left "Invalid dimensions format (use WxH)"
+      | "-aa0" == arg = go rest cfg { aa = False }
+      | "-aa1" == arg = go rest cfg { aa = True }
+      | otherwise = go rest cfg { srcFiles = srcFiles cfg ++ [arg] }
 
 runCommand :: Config -> IO ()
 runCommand cfg = case cmd cfg of
-    Generate -> runGenerate cfg
-    Breed    -> runBreed cfg
-    Render   -> runRender cfg
-
-runGenerate :: Config -> IO ()
-runGenerate cfg = do
-    let outPath = if null (srcFiles cfg) then "population.gen" else last (srcFiles cfg)
-    putStrLn $ "Generating " ++ show (genSize cfg) ++ " images at depth " ++ show (depth cfg) ++ "..."
-    pop <- generatePopulation cfg
-    if null pop then return () else do
-        writePopulation outPath pop
-        putStrLn $ "Saved to " ++ outPath
-
-runRender :: Config -> IO ()
-runRender cfg = do
-    let paths = if null (srcFiles cfg) then ["population.gen"] else srcFiles cfg
-    mapM_ (renderFile cfg) paths
-  where
-    renderFile cfg path = do
-        result <- readPopulation path
-        case result of
-            Left err -> putStrLn $ "Error reading " ++ path ++ ": " ++ err
-            Right pop -> do
-                putStrLn $ "Rendering " ++ show (length pop) ++ " images from " ++ path ++ "..."
-                mapM_ (renderAndSave cfg) (zip [0..] pop)
-                putStrLn $ "Finished " ++ path ++ "."
-    renderAndSave cfg (idx, Genotype name expr) = do
-        let filename = name ++ ".png"
-        case renderExpr cfg expr of
-            Left err -> putStrLn $ "  Error rendering " ++ filename ++ ": " ++ err
-            Right img -> do
-                writePng filename img
-                putStrLn $ "  [" ++ padNum idx ++ "] Wrote " ++ filename
-    padNum n = if n < 10 then "00" ++ show n else if n < 100 then "0" ++ show n else show n
-
-runBreed :: Config -> IO ()
-runBreed cfg = do
-    let paths = if null (srcFiles cfg) then ["population.gen"] else srcFiles cfg
-        (inputs, output) = if length paths == 1 then (paths, head paths) else (init paths, last paths)
-    result <- mapM readPopulation inputs
-    dictE <- readDictionary (dictFile cfg)
-    case (lefts result, dictE) of
-        (err:_, _) -> putStrLn $ "Error: " ++ err
-        (_, Left err) -> putStrLn $ "Dictionary error: " ++ err
-        (_, Right dict) -> do
-            let allParents = concat (rights result)
-                exprs = map (\(Genotype _ e) -> e) allParents
-                n = length exprs
-            if n < 2
-                then putStrLn "Error: Need at least 2 parents to breed."
-                else do
-                    putStrLn $ "Breeding " ++ show n ++ " parents..."
+    Generate -> do
+        pop <- generatePopulation cfg
+        if null pop then return ()
+        else case srcFiles cfg of
+            [outFile] -> writePopulation outFile pop
+            _ -> putStrLn "Please specify exactly one output file for --generate"
+    Render -> do
+        forM_ (srcFiles cfg) $ \srcFile -> do
+            result <- readPopulation srcFile
+            case result of
+                Left err -> putStrLn $ "Error reading " ++ srcFile ++ ": " ++ err
+                Right pop -> forM_ pop $ \(Genotype name expr) -> do
+                    imgResult <- renderExpr cfg expr
+                    case imgResult of
+                        Left err -> putStrLn $ "Error rendering " ++ name ++ ": " ++ err
+                        Right img -> do
+                            let outPath = name ++ ".png"
+                            writePng outPath img
+                            putStrLn $ "Saved " ++ outPath
+    Breed -> do
+        forM_ (srcFiles cfg) $ \srcFile -> do
+            result <- readPopulation srcFile
+            case result of
+                Left err -> putStrLn $ "Error reading " ++ srcFile ++ ": " ++ err
+                Right pop -> do
                     g <- newStdGen
-                    let pairs = [(i, j) | i <- [0..n-1], j <- [0..n-1], i /= j]
-                    let (childExprs, g1) = mapStateList (\gen (i, j) -> breedPair gen (mutation cfg) (exprs !! i) (exprs !! j)) g pairs
-                        (childNames, _) = mapStateList (\gen _ -> randomName gen dict) g1 childExprs
-                        childGenotypes = zipWith Genotype childNames childExprs
-                    writePopulation output childGenotypes
-                    putStrLn $ "Generated " ++ show (length childGenotypes) ++ " offspring."
-                    putStrLn $ "Saved to " ++ output
+                    let bredPop = breedPopulation g (mutation cfg) pop
+                    case srcFiles cfg of
+                        [outFile] -> writePopulation outFile bredPop
+                        _ -> putStrLn "Please specify exactly one output file for --breed"
 
--- =============================================================================
--- Main
--- =============================================================================
+breedPopulation :: StdGen -> Int -> Population -> Population
+breedPopulation g rate pop = map (mutateGenotype g rate) pop
+
+mutateGenotype :: StdGen -> Int -> Genotype -> Genotype
+mutateGenotype g rate (Genotype name expr) =
+    let (newExpr, _) = mutateExpr g rate expr
+    in Genotype name newExpr
 
 main :: IO ()
 main = do

@@ -1,14 +1,18 @@
 name: monadrian
 version: 0.1.0.0
+
 executable:
   main: Main.hs
+  ghc-options:
+    - -Wall
+    - -O2
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
   dependencies:
     - base >= 4.14 && < 5
     - parsec >= 3.1
     - JuicyPixels >= 3.3
     - random >= 1.2
     - vector >= 0.12
-ghc-options:
-  - -Wall
-  - -O2
-  
+    - parallel >= 3.2
