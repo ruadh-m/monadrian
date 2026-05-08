@@ -57,7 +57,7 @@ data Expr
     | EWarpedBwNoise Expr Expr Expr Expr
     | EWarpedColorNoise Expr Expr Expr Expr
     | EBlur Expr
-    | EHighPass Expr  -- Renamed from EBandPass (was actually computing high-pass)
+    | EHighPass Expr
     | EGradMag Expr
     | EGradDir Expr
     | EBump Expr Expr Expr Expr
@@ -77,28 +77,28 @@ data Dictionary = Dictionary [String] [String] [String]
 data Command = Generate | Breed | Render deriving (Show, Eq)
 
 data Config = Config
-    { cmd      :: Command
-    , depth    :: Int
-    , mutation :: Int
-    , genSize  :: Int
-    , width    :: Int
-    , height   :: Int
-    , aa       :: Bool
-    , dictFile :: String
-    , srcFiles :: [String]
+    { cmd        :: Command
+    , depthRange :: (Int, Int)
+    , mutation   :: Int
+    , genSize    :: Int
+    , width      :: Int
+    , height     :: Int
+    , aa         :: Bool
+    , dictFile   :: String
+    , srcFiles   :: [String]
     } deriving (Show)
 
 defaultConfig :: Config
 defaultConfig = Config
-    { cmd      = Generate
-    , depth    = 3
-    , mutation = 5
-    , genSize  = 10
-    , width    = 256
-    , height   = 256
-    , aa       = False
-    , dictFile = "dictionary.txt"
-    , srcFiles = []
+    { cmd        = Generate
+    , depthRange = (1, 3)
+    , mutation   = 5
+    , genSize    = 10
+    , width      = 256
+    , height     = 256
+    , aa         = False
+    , dictFile   = "dictionary.txt"
+    , srcFiles   = []
     }
 
 -- =============================================================================
@@ -176,7 +176,7 @@ parseBinary1 "log"      a = ELog   <$> toExpr a
 parseBinary1 "round"    a = ERound <$> toExpr a
 parseBinary1 "blur"     a = EBlur  <$> toExpr a
 parseBinary1 "high-pass" a = EHighPass <$> toExpr a
-parseBinary1 "band-pass" a = EHighPass <$> toExpr a  -- Add this line
+parseBinary1 "band-pass" a = EHighPass <$> toExpr a
 parseBinary1 "grad-mag" a = EGradMag <$> toExpr a
 parseBinary1 "grad-dir" a = EGradDir <$> toExpr a
 parseBinary1 fn _         = Left $ "Unknown function: " ++ fn
@@ -588,7 +588,6 @@ evalExpr (EIfs aExpr bExpr cExpr dExpr) x y = do
         c = extractScalar vc; d = extractScalar vd
     Just (Scalar (ifsIter x y a b c d 8))
 
--- Color Spaces & Warped Noise
 evalExpr (EHsvToRgb hExpr sExpr vExpr) x y = do
     vh <- evalExpr hExpr x y; vs <- evalExpr sExpr x y; vv <- evalExpr vExpr x y
     let h = extractScalar vh; s = extractScalar vs; v = extractScalar vv
@@ -610,7 +609,6 @@ evalExpr (EWarpedColorNoise uExpr vExpr fExpr sExpr) x y = do
         (r, g, b) = colorNoise2D (u * freq) (v * freq) seed
     Just (Color r g b)
 
--- Image Processing (Analytical)
 evalExpr (EBlur a) x y = Just (analyticalBlur a x y)
 
 evalExpr (EHighPass a) x y = 
@@ -618,9 +616,7 @@ evalExpr (EHighPass a) x y =
         lowVals = [ evalSafe a (x + dx') (y + dy') | dx' <- [-largeDelta, 0, largeDelta], dy' <- [-largeDelta, 0, largeDelta] ]
         lowPV = foldl' (binaryOp (+)) (Scalar 0) lowVals
         lowFreq = binaryOp safeDiv lowPV (Scalar 9.0)
-
         highFreq = analyticalBlur a x y
-
         diff = binaryOp (-) highFreq lowFreq
     in Just (binaryOp (*) diff (Scalar 5.0)) 
 
@@ -717,7 +713,6 @@ renderExpr cfg expr = return $ Right $ generateImageParallel pixelFn (width cfg)
     accumulate (r, g, b, c) (Scalar s) = (r + s, g + s, b + s, c + 1)
     accumulate (r, g, b, c) (Color cr cg cb) = (r + cr, g + cg, b + cb, c + 1)
 
--- | Splits image generation by row, evaluating strictly in parallel across all CPU cores
 generateImageParallel :: (Int -> Int -> PixelRGB8) -> Int -> Int -> Image PixelRGB8
 generateImageParallel gen w h = 
     let rows = map genRow [0..h-1]
@@ -755,21 +750,25 @@ randomName g (Dictionary a1 a2 n) =
 -- Random Expression Generator
 -- =============================================================================
 
-randomExpr :: StdGen -> Int -> (Expr, StdGen)
-randomExpr g 0 = randomLeaf g
-randomExpr g depth =
-    let (isLeaf, g1) = randomR (0, 3 :: Int) g
-    in if isLeaf == 0
-       then randomLeaf g1
-       else let (fnIdx, g2) = randomR (0, 31 :: Int) g1
-            in if fnIdx < 9        -- 9 Unaries
-               then randomUnary g2 depth
-               else if fnIdx < 26   -- 17 Binaries (9 to 25)
-               then randomBinary g2 depth
-               else if fnIdx < 28   -- 2 Ternaries
-               then randomTernary g2 depth
-               else                 -- 4 Quaternaries
-                    randomQuaternary g2 depth
+randomExpr :: StdGen -> (Int, Int) -> (Expr, StdGen)
+randomExpr g (minD, maxD)
+    | maxD <= 0 = randomLeaf g
+    | minD > 0  = genNonLeaf g (minD - 1, maxD - 1)
+    | otherwise =
+        let (isLeaf, g1) = randomR (0, 3 :: Int) g
+        in if isLeaf == 0
+           then randomLeaf g1
+           else genNonLeaf g1 (0, maxD - 1)
+  where
+    genNonLeaf g' (mn, mx) =
+        let (fnIdx, g2) = randomR (0, 31 :: Int) g'
+        in if fnIdx < 9
+           then randomUnary g2 (mn, mx)
+           else if fnIdx < 26
+           then randomBinary g2 (mn, mx)
+           else if fnIdx < 28
+           then randomTernary g2 (mn, mx)
+           else randomQuaternary g2 (mn, mx)
 
 randomLeaf :: StdGen -> (Expr, StdGen)
 randomLeaf g =
@@ -786,10 +785,10 @@ randomLeaf g =
     (cg, g4) = randomR (0.0, 1.0) g3
     (cb, g5) = randomR (0.0, 1.0) g4
 
-randomUnary :: StdGen -> Int -> (Expr, StdGen)
-randomUnary g depth =
+randomUnary :: StdGen -> (Int, Int) -> (Expr, StdGen)
+randomUnary g (minD, maxD) =
     let (idx, g1) = randomR (0, 8 :: Int) g
-        (a, g2) = randomExpr g1 (depth - 1)
+        (a, g2) = randomExpr g1 (max 0 (minD - 1), maxD - 1)
     in case idx of
         0 -> (EAbs a, g2)
         1 -> (ESin a, g2)
@@ -802,8 +801,8 @@ randomUnary g depth =
         8 -> (EGradDir a, g2)
         _ -> (EAbs a, g2)
 
-randomBinary :: StdGen -> Int -> (Expr, StdGen)
-randomBinary g depth =
+randomBinary :: StdGen -> (Int, Int) -> (Expr, StdGen)
+randomBinary g (minD, maxD) =
     let fns = [ EAdd, ESub, EMult, EDiv, EMod
               , EAnd, EOr, EXor
               , EPolarCoords
@@ -811,28 +810,28 @@ randomBinary g depth =
               , EMandelbrot, ENewton, EBwNoise, EColorNoise ]
         (idx, g1) = randomR (0, length fns - 1) g
         fn = fns !! idx
-        (a, g2) = randomExpr g1 (depth - 1)
-        (b, g3) = randomExpr g2 (depth - 1)
+        (a, g2) = randomExpr g1 (max 0 (minD - 1), maxD - 1)
+        (b, g3) = randomExpr g2 (max 0 (minD - 1), maxD - 1)
     in (fn a b, g3)
 
-randomTernary :: StdGen -> Int -> (Expr, StdGen)
-randomTernary g depth =
+randomTernary :: StdGen -> (Int, Int) -> (Expr, StdGen)
+randomTernary g (minD, maxD) =
     let (idx, g1) = randomR (0, 1 :: Int) g
-        (a, g2) = randomExpr g1 (depth - 1)
-        (b, g3) = randomExpr g2 (depth - 1)
-        (c, g4) = randomExpr g3 (depth - 1)
+        (a, g2) = randomExpr g1 (max 0 (minD - 1), maxD - 1)
+        (b, g3) = randomExpr g2 (max 0 (minD - 1), maxD - 1)
+        (c, g4) = randomExpr g3 (max 0 (minD - 1), maxD - 1)
     in case idx of
         0 -> (EJulia a b c, g4)
         1 -> (EHsvToRgb a b c, g4)
         _ -> (EJulia a b c, g4)
 
-randomQuaternary :: StdGen -> Int -> (Expr, StdGen)
-randomQuaternary g depth =
+randomQuaternary :: StdGen -> (Int, Int) -> (Expr, StdGen)
+randomQuaternary g (minD, maxD) =
     let (idx, g1) = randomR (0, 3 :: Int) g
-        (a, g2) = randomExpr g1 (depth - 1)
-        (b, g3) = randomExpr g2 (depth - 1)
-        (c, g4) = randomExpr g3 (depth - 1)
-        (d, g5) = randomExpr g4 (depth - 1)
+        (a, g2) = randomExpr g1 (max 0 (minD - 1), maxD - 1)
+        (b, g3) = randomExpr g2 (max 0 (minD - 1), maxD - 1)
+        (c, g4) = randomExpr g3 (max 0 (minD - 1), maxD - 1)
+        (d, g5) = randomExpr g4 (max 0 (minD - 1), maxD - 1)
     in case idx of
         0 -> (EWarpedBwNoise a b c d, g5)
         1 -> (EWarpedColorNoise a b c d, g5)
@@ -849,7 +848,7 @@ generatePopulation cfg = do
             return []
         Right dict -> do
             g <- newStdGen
-            let (exprs, g1) = mapStateList (\gen _ -> randomExpr gen (depth cfg)) g [1..genSize cfg]
+            let (exprs, g1) = mapStateList (\gen _ -> randomExpr gen (depthRange cfg)) g [1..genSize cfg]
                 (names, _) = mapStateList (\gen _ -> randomName gen dict) g1 [1..genSize cfg]
             return (zipWith Genotype names exprs)
 
@@ -984,7 +983,7 @@ applyRandomMutation :: StdGen -> Int -> Expr -> (Expr, StdGen)
 applyRandomMutation g rate expr =
     let (mType, g1) = randomR (0, 6 :: Int) g
     in case mType of
-        0 -> let depth = min 5 (max 2 (sizeExpr expr `div` 3)) in randomExpr g1 depth
+        0 -> let depth = min 5 (max 2 (sizeExpr expr `div` 3)) in randomExpr g1 (1, depth)
         1 -> case expr of
                 EConst d -> let (delta, g2) = randomR (-0.2, 0.2) g1 in (EConst (d + delta), g2)
                 _ -> (expr, g1)
@@ -1109,9 +1108,6 @@ unwrapFunction g expr =
 -- Crossover Operations
 -- =============================================================================
 
--- | Traverses the expression and replaces the node at the specified index.
--- Uses size-aware traversal so the index is interpreted consistently with
--- getAllNodes.
 replaceNodeAt :: Int -> Expr -> Expr -> Expr
 replaceNodeAt 0 rep _ = rep
 replaceNodeAt _ rep (EConst d) = EConst d
@@ -1272,7 +1268,6 @@ replaceNodeAt n rep (EBump a b c d) =
                  then EBump a b (replaceNodeAt (n-1-sza-szb) rep c) d
                  else EBump a b c (replaceNodeAt (n-1-sza-szb-szc) rep d)
 
--- | Swaps a random subtree from parent 2 into a random location in parent 1
 subtreeCrossover :: StdGen -> Expr -> Expr -> (Expr, StdGen)
 subtreeCrossover g p1 p2 =
     let nodes1 = getAllNodes p1
@@ -1283,9 +1278,6 @@ subtreeCrossover g p1 p2 =
         newP1 = replaceNodeAt i1 sub2 p1
     in (newP1, g2)
 
--- | Breeds a new population using crossover and mutation.
--- Each unordered pair breeds exactly once, and parent roles are randomized
--- so subtreeCrossover asymmetry does not bias the population.
 breedPopulation :: Config -> StdGen -> Population -> IO Population
 breedPopulation cfg g pop =
     if length pop < 2
@@ -1299,16 +1291,15 @@ breedPopulation cfg g pop =
             Right dict -> do
                 let indexed = zip [0..] pop
                     pairs = [ (a, b) | (i, a) <- indexed, (j, b) <- indexed, i < j ]
-                    targetSize = genSize cfg
-                    neededPairs = take targetSize pairs
+                    numPairs = length pairs
                     breedOne g' (Genotype _ e1, Genotype _ e2) =
                         let (swap, g1) = randomR (False, True) g'
                             (p1, p2) = if swap then (e2, e1) else (e1, e2)
                             (eC, g2) = subtreeCrossover g1 p1 p2
                             (eM, g3) = mutateExpr g2 (mutation cfg) eC
                         in (eM, g3)
-                    (childExprs, g1) = mapStateList breedOne g neededPairs
-                    (names, _) = mapStateList (\gen _ -> randomName gen dict) g1 [1..targetSize]
+                    (childExprs, g1) = mapStateList breedOne g pairs
+                    (names, _) = mapStateList (\gen _ -> randomName gen dict) g1 [1..numPairs]
                 return (zipWith Genotype names childExprs)
 
 -- =============================================================================
@@ -1320,7 +1311,10 @@ parseArgs [] cfg = cfg
 parseArgs ("--generate":rest) cfg = parseArgs rest (cfg { cmd = Generate })
 parseArgs ("--breed":rest) cfg = parseArgs rest (cfg { cmd = Breed })
 parseArgs ("--render":rest) cfg = parseArgs rest (cfg { cmd = Render })
-parseArgs (('-':'d':ds):rest) cfg = parseArgs rest (cfg { depth = read ds })
+parseArgs (('-':'d':ds):rest) cfg =
+    case break (== '-') ds of
+        (minStr, '-':maxStr) -> parseArgs rest (cfg { depthRange = (read minStr, read maxStr) })
+        _                    -> parseArgs rest (cfg { depthRange = (1, read ds) })
 parseArgs (('-':'m':ds):rest) cfg = parseArgs rest (cfg { mutation = read ds })
 parseArgs (('-':'g':gs):rest) cfg = parseArgs rest (cfg { genSize = read gs })
 parseArgs (('-':'a':'a':aa):rest) cfg = parseArgs rest (cfg { aa = aa == "1" })
@@ -1342,15 +1336,19 @@ main = do
                 _ -> putStrLn "Usage: monadrian --generate -g<n> -d<n> <output_file>"
         Breed -> do
             case srcFiles cfg of
-                [inFile, outFile] -> do
-                    result <- readPopulation inFile
-                    case result of
+                [] -> putStrLn "Usage: monadrian --breed -m<n> <input_files...> <output_file>"
+                [_] -> putStrLn "Usage: monadrian --breed -m<n> <input_files...> <output_file>"
+                files -> do
+                    let inFiles = init files
+                        outFile = last files
+                    results <- mapM readPopulation inFiles
+                    case sequence results of
                         Left err -> putStrLn err
-                        Right pop -> do
+                        Right pops -> do
+                            let combinedPop = concat pops
                             g <- newStdGen
-                            newPop <- breedPopulation cfg g pop
+                            newPop <- breedPopulation cfg g combinedPop
                             writePopulation outFile newPop
-                _ -> putStrLn "Usage: monadrian --breed -m<n> <input_file> <output_file>"
         Render -> do
             forM_ (srcFiles cfg) $ \inFile -> do
                 result <- readPopulation inFile
